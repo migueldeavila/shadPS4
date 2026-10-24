@@ -13,6 +13,25 @@ void StartWatchdog();
 
 void NotifyFlip();
 
+enum class Counter : u32 {
+    ReadFaultGpuThread,
+    ReadFaultOtherThread,
+    WriteFault,
+    Downloads,
+    DownloadBytes,
+    DownloadWaitUs,
+    PipelineCompiles,
+    GpuThreadIdleUs,
+    FenceWaitUs,
+    GpuWrittenBindings,
+    GpuWrittenBytes,
+    Count,
+};
+
+void AddCounter(Counter counter, u64 value = 1);
+
+void RecordReadFaultSite(u64 code_address, u64 fault_address);
+
 bool IsFrameTraceActive();
 
 u32 NextFrameTraceIndex();

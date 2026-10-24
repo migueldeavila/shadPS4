@@ -462,8 +462,14 @@ struct SignalImpl : public PageManager::Impl {
         const auto is_gpu_thread =
             std::this_thread::get_id() == rasterizer->GetGpuCommandProcessorThread();
         if (Common::IsWriteError(context)) {
+            Core::Diagnostics::AddCounter(Core::Diagnostics::Counter::WriteFault);
             return rasterizer->InvalidateMemory(addr, size, is_gpu_thread);
         } else {
+            Core::Diagnostics::AddCounter(is_gpu_thread
+                                              ? Core::Diagnostics::Counter::ReadFaultGpuThread
+                                              : Core::Diagnostics::Counter::ReadFaultOtherThread);
+            Core::Diagnostics::RecordReadFaultSite(reinterpret_cast<u64>(Common::GetRip(context)),
+                                                   addr);
             return rasterizer->ReadMemory(addr, size, is_gpu_thread);
         }
         return false;

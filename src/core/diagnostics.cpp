@@ -1,14 +1,19 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <array>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdlib>
+#include <fstream>
 #include <map>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 #include <fmt/format.h>
 #include "common/logging/log.h"
@@ -34,6 +39,14 @@ std::jthread g_watchdog;
 std::atomic<bool> g_frame_trace_pending{false};
 std::atomic<bool> g_frame_trace_active{false};
 std::atomic<u32> g_frame_trace_index{0};
+std::array<std::atomic<u64>, static_cast<size_t>(Counter::Count)> g_counters{};
+struct FaultSite {
+    u64 count;
+    u64 last_fault;
+};
+std::atomic<bool> g_fault_sites_active{false};
+std::mutex g_fault_sites_mutex;
+std::unordered_map<u64, FaultSite> g_fault_sites;
 
 struct GuestStack {
     u64 size;
@@ -220,6 +233,136 @@ void ReportAllThreads(std::string_view reason) {
     Common::Log::Flush();
 }
 
+HANDLE OpenThreadByName(std::string_view name, DWORD& tid) {
+    const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return nullptr;
+    }
+    HANDLE found = nullptr;
+    THREADENTRY32 entry{.dwSize = sizeof(THREADENTRY32)};
+    for (BOOL ok = Thread32First(snapshot, &entry); ok && !found;
+         ok = Thread32Next(snapshot, &entry)) {
+        if (entry.th32OwnerProcessID != GetCurrentProcessId()) {
+            continue;
+        }
+        const HANDLE handle = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
+                                             THREAD_QUERY_LIMITED_INFORMATION,
+                                         FALSE, entry.th32ThreadID);
+        if (!handle) {
+            continue;
+        }
+        if (ThreadName(handle) == name) {
+            found = handle;
+            tid = entry.th32ThreadID;
+        } else {
+            CloseHandle(handle);
+        }
+    }
+    CloseHandle(snapshot);
+    return found;
+}
+
+void ProfileThread(std::string_view name, std::chrono::seconds duration) {
+    constexpr u32 MaxFrames = 12;
+    constexpr size_t TopN = 40;
+    DWORD tid = 0;
+    const HANDLE thread = OpenThreadByName(name, tid);
+    if (!thread) {
+        LOG_ERROR(Debug, "Profiler: no thread named '{}'", name);
+        return;
+    }
+    LOG_INFO(Debug, "Profiler: sampling '{}' (tid {}) for {}s", name, tid, duration.count());
+    {
+        std::scoped_lock lock{g_fault_sites_mutex};
+        g_fault_sites.clear();
+    }
+    g_fault_sites_active = true;
+
+    std::unordered_map<u64, u32> exclusive;
+    std::unordered_map<u64, u32> inclusive;
+    u32 samples = 0;
+    u32 guest_samples = 0;
+    const auto end = std::chrono::steady_clock::now() + duration;
+    while (std::chrono::steady_clock::now() < end) {
+        std::array<u64, MaxFrames> frames{};
+        u32 depth = 0;
+        u64 leaf_rip = 0;
+        if (SuspendThread(thread) != static_cast<DWORD>(-1)) {
+            alignas(16) CONTEXT ctx{};
+            ctx.ContextFlags = CONTEXT_FULL;
+            if (GetThreadContext(thread, &ctx)) {
+                leaf_rip = ctx.Rip;
+                for (; depth < MaxFrames && ctx.Rip; ++depth) {
+                    DWORD64 image_base = 0;
+                    auto* entry = RtlLookupFunctionEntry(ctx.Rip, &image_base, nullptr);
+                    if (!entry) {
+                        frames[depth] = ctx.Rip;
+                        if (depth != 0 || !ReadU64(ctx.Rsp, ctx.Rip)) {
+                            ++depth;
+                            break;
+                        }
+                        ctx.Rsp += 8;
+                        continue;
+                    }
+                    frames[depth] = image_base + entry->BeginAddress;
+                    void* handler_data = nullptr;
+                    DWORD64 establisher = 0;
+                    RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, ctx.Rip, entry, &ctx,
+                                     &handler_data, &establisher, nullptr);
+                }
+            }
+            ResumeThread(thread);
+        }
+        if (depth > 0) {
+            ++samples;
+            guest_samples += FindGuestModule(leaf_rip) != nullptr;
+            ++exclusive[frames[0]];
+            for (u32 i = 0; i < depth; ++i) {
+                if (std::find(frames.begin(), frames.begin() + i, frames[i]) ==
+                    frames.begin() + i) {
+                    ++inclusive[frames[i]];
+                }
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    CloseHandle(thread);
+    g_fault_sites_active = false;
+    std::vector<std::pair<u64, FaultSite>> sites;
+    {
+        std::scoped_lock lock{g_fault_sites_mutex};
+        sites.assign(g_fault_sites.begin(), g_fault_sites.end());
+    }
+    std::ranges::sort(sites,
+                      [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
+    std::string sites_report;
+    for (size_t i = 0; i < std::min<size_t>(25, sites.size()); ++i) {
+        sites_report += fmt::format("  {:>7} {} (last fault {:#x})\n", sites[i].second.count,
+                                    DescribeAddress(sites[i].first), sites[i].second.last_fault);
+    }
+    LOG_INFO(Debug, "Read-fault sites during profile ({} distinct):\n{}", sites.size(),
+             sites_report);
+
+    const auto top = [&](const std::unordered_map<u64, u32>& counts) {
+        std::vector<std::pair<u64, u32>> sorted(counts.begin(), counts.end());
+        std::ranges::sort(sorted, [](const auto& a, const auto& b) { return a.second > b.second; });
+        std::string out;
+        for (size_t i = 0; i < std::min(TopN, sorted.size()); ++i) {
+            out += fmt::format("  {:5.1f}% {:>6} {}\n", 100.0 * sorted[i].second / samples,
+                               sorted[i].second, DescribeAddress(sorted[i].first));
+        }
+        return out;
+    };
+    if (samples == 0) {
+        return;
+    }
+    LOG_INFO(Debug,
+             "Profiler '{}': {} samples, {:.1f}% in guest code\nExclusive (leaf function):\n{}"
+             "Inclusive (on stack):\n{}",
+             name, samples, 100.0 * guest_samples / samples, top(exclusive), top(inclusive));
+    Common::Log::Flush();
+}
+
 void WatchdogBody(std::stop_token token) {
     Common::SetCurrentThreadName("shadPS4:Watchdog");
     using Clock = std::chrono::steady_clock;
@@ -228,6 +371,7 @@ void WatchdogBody(std::stop_token token) {
     const auto hang_threshold = std::chrono::seconds(env ? std::max(1, std::atoi(env)) : 10);
     const auto trigger_path = Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "dump_now";
     const auto trace_path = Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "trace_frame";
+    const auto profile_path = Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "profile_now";
     constexpr auto FpsInterval = std::chrono::seconds(5);
     constexpr u32 MaxHangReports = 3;
 
@@ -236,6 +380,7 @@ void WatchdogBody(std::stop_token token) {
     u64 interval_start_flips = last_flips;
     auto interval_start = Clock::now();
     bool hang_reported = false;
+    std::array<u64, static_cast<size_t>(Counter::Count)> last_counters{};
     u32 hang_reports = 0;
 
     while (!token.stop_requested()) {
@@ -253,6 +398,26 @@ void WatchdogBody(std::stop_token token) {
             LOG_INFO(Debug, "Watchdog: {:.1f} flips/s ({} total), {} guest stacks registered",
                      static_cast<double>(flips - interval_start_flips) / seconds, flips,
                      guest_stacks);
+            std::array<u64, static_cast<size_t>(Counter::Count)> now_counters{};
+            for (size_t i = 0; i < now_counters.size(); ++i) {
+                now_counters[i] = g_counters[i].load(std::memory_order_relaxed);
+            }
+            const auto delta = [&](Counter c) {
+                const auto i = static_cast<size_t>(c);
+                return static_cast<double>(now_counters[i] - last_counters[i]) / seconds;
+            };
+            LOG_INFO(Debug,
+                     "Perf/s: read faults gpu-thread {:.0f} other {:.0f}, write faults {:.0f}, "
+                     "downloads {:.0f} ({:.2f} MB, wait {:.1f} ms), pipeline compiles {:.1f}, "
+                     "gpu-thread idle {:.0f} ms, fence waits {:.0f} ms, written bindings {:.0f} "
+                     "({:.1f} MB marked GPU-modified)",
+                     delta(Counter::ReadFaultGpuThread), delta(Counter::ReadFaultOtherThread),
+                     delta(Counter::WriteFault), delta(Counter::Downloads),
+                     delta(Counter::DownloadBytes) / 1e6, delta(Counter::DownloadWaitUs) / 1e3,
+                     delta(Counter::PipelineCompiles), delta(Counter::GpuThreadIdleUs) / 1e3,
+                     delta(Counter::FenceWaitUs) / 1e3, delta(Counter::GpuWrittenBindings),
+                     delta(Counter::GpuWrittenBytes) / 1e6);
+            last_counters = now_counters;
             interval_start = now;
             interval_start_flips = flips;
         }
@@ -284,6 +449,19 @@ void WatchdogBody(std::stop_token token) {
             std::filesystem::remove(trace_path, ec);
             g_frame_trace_pending = true;
             LOG_INFO(Debug, "Frame trace armed for the next frame");
+        }
+        if (std::filesystem::exists(profile_path, ec)) {
+            std::string name;
+            {
+                std::ifstream file{profile_path};
+                std::getline(file, name);
+            }
+            std::filesystem::remove(profile_path, ec);
+            while (!name.empty() && std::isspace(static_cast<unsigned char>(name.back()))) {
+                name.pop_back();
+            }
+            ProfileThread(name.empty() ? "shadPS4:GpuCommandProcessor" : name,
+                          std::chrono::seconds(5));
         }
     }
 }
@@ -320,6 +498,20 @@ void NotifyFlip() {
         g_frame_trace_active = true;
         LOG_INFO(Debug, "[trace] begin frame after flip {}", flip);
     }
+}
+
+void AddCounter(Counter counter, u64 value) {
+    g_counters[static_cast<size_t>(counter)].fetch_add(value, std::memory_order_relaxed);
+}
+
+void RecordReadFaultSite(u64 code_address, u64 fault_address) {
+    if (!g_fault_sites_active.load(std::memory_order_relaxed)) {
+        return;
+    }
+    std::scoped_lock lock{g_fault_sites_mutex};
+    auto& site = g_fault_sites[code_address];
+    ++site.count;
+    site.last_fault = fault_address;
 }
 
 bool IsFrameTraceActive() {

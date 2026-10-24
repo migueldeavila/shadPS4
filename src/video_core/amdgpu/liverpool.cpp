@@ -9,6 +9,7 @@
 #include "common/scope_exit.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
+#include "core/diagnostics.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/process.h"
 #include "core/libraries/videoout/driver.h"
@@ -130,9 +131,14 @@ void Liverpool::Process(std::stop_token stoken) {
 
     while (!stoken.stop_requested()) {
         {
+            const auto idle_start = std::chrono::steady_clock::now();
             std::unique_lock lk{submit_mutex};
             Common::CondvarWait(submit_cv, lk, stoken,
                                 [this] { return num_commands || num_submits || submit_done; });
+            Core::Diagnostics::AddCounter(Core::Diagnostics::Counter::GpuThreadIdleUs,
+                                          std::chrono::duration_cast<std::chrono::microseconds>(
+                                              std::chrono::steady_clock::now() - idle_start)
+                                              .count());
         }
         if (stoken.stop_requested()) {
             break;

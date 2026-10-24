@@ -3,6 +3,7 @@
 
 #include "common/assert.h"
 #include "common/debug.h"
+#include "core/diagnostics.h"
 #include "common/thread.h"
 #include "imgui/renderer/texture_manager.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -128,7 +129,12 @@ void Scheduler::Wait(u64 tick) {
         SubmitInfo info{};
         Flush(info);
     }
+    const auto wait_start = std::chrono::steady_clock::now();
     work_semaphore.Wait(tick);
+    Core::Diagnostics::AddCounter(Core::Diagnostics::Counter::FenceWaitUs,
+                                  std::chrono::duration_cast<std::chrono::microseconds>(
+                                      std::chrono::steady_clock::now() - wait_start)
+                                      .count());
 }
 
 void Scheduler::PopPendingOperations() {

@@ -7,6 +7,7 @@
 
 #include "common/alignment.h"
 #include "core/debug_state.h"
+#include "core/diagnostics.h"
 #include "core/memory.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/buffer_cache/buffer.h"
@@ -182,6 +183,8 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     if (total_size_bytes == 0) {
         return;
     }
+    Core::Diagnostics::AddCounter(Core::Diagnostics::Counter::Downloads);
+    Core::Diagnostics::AddCounter(Core::Diagnostics::Counter::DownloadBytes, total_size_bytes);
     const auto download =
         staging_pool.Request(total_size_bytes, VideoCore::MemoryType::HostCached, 16, async);
     for (auto& copy : copies) {
@@ -207,7 +210,12 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     if (async) {
         scheduler.DeferOperation(std::move(write_data));
     } else {
+        const auto wait_start = std::chrono::steady_clock::now();
         scheduler.Finish();
+        Core::Diagnostics::AddCounter(Core::Diagnostics::Counter::DownloadWaitUs,
+                                      std::chrono::duration_cast<std::chrono::microseconds>(
+                                          std::chrono::steady_clock::now() - wait_start)
+                                          .count());
         write_data();
     }
 }
@@ -234,6 +242,8 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     }
     SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
     if (is_written) {
+        Core::Diagnostics::AddCounter(Core::Diagnostics::Counter::GpuWrittenBindings);
+        Core::Diagnostics::AddCounter(Core::Diagnostics::Counter::GpuWrittenBytes, size);
         gpu_modified_ranges.Add(device_addr, size);
     }
     return {arena, arena->Offset(device_addr)};
