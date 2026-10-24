@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <unordered_set>
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
 #include "video_core/buffer_cache/buffer_cache.h"
@@ -175,6 +176,8 @@ private:
 
     bool attachment_feedback_loop{};
     bool needs_barrier{};
+    std::unordered_set<u64> clamped_buffer_stages;
+    std::unordered_set<u64> large_written_stages;
 };
 
 } // namespace Vulkan

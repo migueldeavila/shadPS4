@@ -107,6 +107,19 @@ static auto UpdateColorLevels(T sink) {
     return sink;
 }
 
+static void CreateConsoleSink() {
+#ifdef _WIN32
+    if (EmulatorSettings.GetLogType() == "wincolor") {
+        g_console_sink = std::make_shared<spdlog::sinks::wincolor_stdout_sink_mt>();
+    } else {
+        g_console_sink = std::make_shared<spdlog::sinks::msvc_sink_mt>();
+    }
+#else
+    g_console_sink = UpdateColorLevels(std::make_shared<spdlog_stdout>(spdlog::color_mode::always));
+#endif
+    g_console_sink->set_pattern("%^%v%$");
+}
+
 void Setup(std::string_view shadps4_filename) {
     static std::once_flag already_registered;
 
@@ -122,20 +135,7 @@ void Setup(std::string_view shadps4_filename) {
         logger->set_level(spdlog::level::trace);
     }
 
-    // Setup console
-
-#ifdef _WIN32
-    if (EmulatorSettings.GetLogType() == "wincolor") {
-        g_console_sink = std::make_shared<spdlog::sinks::wincolor_stdout_sink_mt>();
-    } else {
-        g_console_sink = std::make_shared<spdlog::sinks::msvc_sink_mt>();
-    }
-
-#else
-    g_console_sink = UpdateColorLevels(std::make_shared<spdlog_stdout>(spdlog::color_mode::always));
-#endif
-
-    g_console_sink->set_pattern("%^%v%$");
+    CreateConsoleSink();
 
     // Setup file
 
@@ -148,6 +148,7 @@ void Setup(std::string_view shadps4_filename) {
 }
 
 void Switch(std::string_view game_filename, bool append_log) {
+    CreateConsoleSink();
     UpdateSinks();
     UpdateLogLevels(EmulatorSettings.GetLogFilter());
     UpdateLogFlushLevel(EmulatorSettings.GetLogFlushLevel());

@@ -856,9 +856,16 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 buffer_infos.emplace_back(VK_NULL_HANDLE, 0, VK_WHOLE_SIZE);
             } else {
                 const u64 size = memory->ClampRangeSize(vsharp.base_address, vsharp.GetSize());
-                if (size != vsharp.GetSize()) {
-                    LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}",
-                              vsharp.GetSize(), size, stage.pgm_hash);
+                if (size != vsharp.GetSize() &&
+                    clamped_buffer_stages.insert(stage.pgm_hash).second) {
+                    LOG_WARNING(Render, "Clamped size from {} to {} for stage {:#x}",
+                                vsharp.GetSize(), size, stage.pgm_hash);
+                }
+                if (desc.is_written && size >= 1_MB &&
+                    large_written_stages.insert(stage.pgm_hash).second) {
+                    LOG_INFO(Render,
+                             "Writable buffer binding of {} bytes (requested {}) for stage {:#x}",
+                             size, vsharp.GetSize(), stage.pgm_hash);
                 }
                 VideoCore::ObtainBufferFlags flags = {};
                 if (desc.is_written) {
