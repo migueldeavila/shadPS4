@@ -17,6 +17,7 @@
 #include "common/thread.h"
 #include "core/diagnostics.h"
 #include "core/linker.h"
+#include "core/memory.h"
 
 #ifdef _WIN32
 #include <dbghelp.h>
@@ -30,6 +31,9 @@ namespace {
 
 std::atomic<u64> g_flip_count{0};
 std::jthread g_watchdog;
+std::atomic<bool> g_frame_trace_pending{false};
+std::atomic<bool> g_frame_trace_active{false};
+std::atomic<u32> g_frame_trace_index{0};
 
 struct GuestStack {
     u64 size;
@@ -223,6 +227,7 @@ void WatchdogBody(std::stop_token token) {
     const char* env = std::getenv("SHADPS4_HANG_SECONDS");
     const auto hang_threshold = std::chrono::seconds(env ? std::max(1, std::atoi(env)) : 10);
     const auto trigger_path = Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "dump_now";
+    const auto trace_path = Common::FS::GetUserPath(Common::FS::PathType::LogDir) / "trace_frame";
     constexpr auto FpsInterval = std::chrono::seconds(5);
     constexpr u32 MaxHangReports = 3;
 
@@ -275,6 +280,11 @@ void WatchdogBody(std::stop_token token) {
             ReportAllThreads("Watchdog: dump requested");
             WriteMinidump("manual", nullptr);
         }
+        if (std::filesystem::exists(trace_path, ec)) {
+            std::filesystem::remove(trace_path, ec);
+            g_frame_trace_pending = true;
+            LOG_INFO(Debug, "Frame trace armed for the next frame");
+        }
     }
 }
 
@@ -289,7 +299,24 @@ void StartWatchdog() {
 }
 
 void NotifyFlip() {
-    g_flip_count.fetch_add(1, std::memory_order_relaxed);
+    const u64 flip = g_flip_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (g_frame_trace_active.exchange(false)) {
+        LOG_INFO(Debug, "[trace] end of frame at flip {} ({} commands)", flip,
+                 g_frame_trace_index.load());
+        Common::Log::Flush();
+    } else if (g_frame_trace_pending.exchange(false)) {
+        g_frame_trace_index = 0;
+        g_frame_trace_active = true;
+        LOG_INFO(Debug, "[trace] begin frame after flip {}", flip);
+    }
+}
+
+bool IsFrameTraceActive() {
+    return g_frame_trace_active.load(std::memory_order_relaxed);
+}
+
+u32 NextFrameTraceIndex() {
+    return g_frame_trace_index.fetch_add(1, std::memory_order_relaxed);
 }
 
 std::string DescribeAddress(u64 address) {
@@ -340,8 +367,11 @@ void ReportUnhandledException(void* exception_pointers, bool guest_thread, s32 g
 }
 
 void RegisterGuestStack(u64 base, u64 size, std::string_view name) {
-    std::unique_lock lock{g_guest_stacks_mutex};
-    g_guest_stacks[base] = {size, std::string(name)};
+    {
+        std::unique_lock lock{g_guest_stacks_mutex};
+        g_guest_stacks[base] = {size, std::string(name)};
+    }
+    Core::Memory::Instance()->InvalidateMemory(base, size);
 }
 
 void UnregisterGuestStack(u64 base) {

@@ -3,6 +3,7 @@
 
 #include "common/debug.h"
 #include "core/debug_state.h"
+#include "core/diagnostics.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "shader_recompiler/resource.h"
@@ -21,6 +22,27 @@
 #include "video_core/texture_cache/texture_cache.h"
 
 namespace Vulkan {
+
+static std::string TraceStageHashes(const Pipeline* pipeline) {
+    std::string hashes;
+    for (const auto* info : pipeline->GetStages()) {
+        if (info) {
+            hashes += fmt::format(" {}={:#x}", info->hw_stage, info->pgm_hash);
+        }
+    }
+    return hashes;
+}
+
+static void TraceGraphics(std::string_view kind, const GraphicsPipeline* pipeline, const auto& regs,
+                          u32 count, u32 instances) {
+    const auto& rt0 = regs.color_buffers[0];
+    LOG_INFO(Render,
+             "[trace] #{} {}{} count={} inst={} prim={} rt0={:#x} {}x{} fmt={}/{} mask={:#x}",
+             Core::Diagnostics::NextFrameTraceIndex(), kind, TraceStageHashes(pipeline), count,
+             instances, static_cast<u32>(regs.primitive_type), rt0 ? rt0.Address() : 0,
+             rt0 ? rt0.Pitch() : 0, rt0 ? rt0.Height() : 0, static_cast<u32>(rt0.GetDataFmt()),
+             static_cast<u32>(rt0.GetNumberFmt()), regs.color_target_mask.raw);
+}
 
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     // TODO(roamic): Add support for multiple viewports and geometry shaders when ViewportIndex
@@ -229,6 +251,10 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         cmdbuf.draw(regs.num_indices, regs.num_instances.NumInstances(), vertex_offset,
                     instance_offset);
     }
+    if (Core::Diagnostics::IsFrameTraceActive()) {
+        TraceGraphics(is_indexed ? "drawIndexed" : "draw", pipeline, regs, regs.num_indices,
+                      regs.num_instances.NumInstances());
+    }
     DebugState.IncDrawCall();
 
     ResetBindings(false);
@@ -313,6 +339,11 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         DebugState.IncDrawCall();
     }
 
+    if (Core::Diagnostics::IsFrameTraceActive()) {
+        TraceGraphics(is_indexed ? "drawIndexedIndirect" : "drawIndirect", pipeline,
+                      liverpool->regs, max_count, 0);
+    }
+
     ResetBindings(false);
 }
 
@@ -346,6 +377,11 @@ void Rasterizer::DispatchDirect() {
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+    if (Core::Diagnostics::IsFrameTraceActive()) {
+        LOG_INFO(Render, "[trace] #{} dispatch{} groups={}x{}x{}",
+                 Core::Diagnostics::NextFrameTraceIndex(), TraceStageHashes(pipeline),
+                 cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+    }
     DebugState.IncDispatch();
 
     ResetBindings(true);
@@ -380,6 +416,10 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
     cmdbuf.dispatchIndirect(buffer->Handle(), base);
+    if (Core::Diagnostics::IsFrameTraceActive()) {
+        LOG_INFO(Render, "[trace] #{} dispatchIndirect{}", Core::Diagnostics::NextFrameTraceIndex(),
+                 TraceStageHashes(pipeline));
+    }
     DebugState.IncDispatch();
 
     ResetBindings(true);
@@ -872,6 +912,12 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             continue;
         }
 
+        if (Core::Diagnostics::IsFrameTraceActive()) {
+            LOG_INFO(Render, "[trace]   tex stage={:#x} addr={:#x} {}x{} fmt={}/{} tiling={}",
+                     stage.pgm_hash, tsharp.Address(), tsharp.width + 1, tsharp.height + 1,
+                     static_cast<u32>(data_fmt), static_cast<u32>(num_fmt),
+                     static_cast<u32>(tsharp.tiling_index));
+        }
         if (!memory->IsValidGpuMapping(tsharp.Address(), 0) ||
             !magic_enum::enum_contains(data_fmt) || !magic_enum::enum_contains(num_fmt)) {
             LOG_WARNING(Render_Vulkan,

@@ -13,6 +13,10 @@ void StartWatchdog();
 
 void NotifyFlip();
 
+bool IsFrameTraceActive();
+
+u32 NextFrameTraceIndex();
+
 std::string DescribeAddress(u64 address);
 
 void ReportUnhandledException(void* exception_pointers, bool guest_thread, s32 guest_signal);
