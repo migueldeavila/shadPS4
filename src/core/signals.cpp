@@ -7,10 +7,13 @@
 #include "common/decoder.h"
 #include "common/signal_context.h"
 #include "core/cpu_patches.h" // Windows static guest red-zone protection
+#include "core/diagnostics.h"
+#include "core/libraries/fiber/fiber.h"
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/kernel/threads/exception.h"
 #include "core/libraries/kernel/threads/pthread.h"
 #include "core/signals.h"
+#include "core/tls.h"
 #include "emulator.h"
 
 #ifdef _WIN32
@@ -28,9 +31,97 @@ namespace Core {
 
 #if defined(_WIN32)
 
-static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
+struct ExceptionStack {
+    static constexpr size_t Size = 256_KB;
+
+    u8* base = nullptr;
+
+    ~ExceptionStack() {
+        if (base) {
+            VirtualFree(base, 0, MEM_RELEASE);
+        }
+    }
+
+    u8* Top() const {
+        return base + Size;
+    }
+
+    bool Contains(uintptr_t sp) const {
+        return base && sp >= reinterpret_cast<uintptr_t>(base) &&
+               sp <= reinterpret_cast<uintptr_t>(Top());
+    }
+};
+
+static thread_local ExceptionStack t_exception_stack;
+static thread_local s64 t_handler_entry_sp = 0;
+
+static void TrackFiberStackHeadroom(const EXCEPTION_POINTERS* pExp) noexcept {
+    static std::atomic<s64> min_headroom{std::numeric_limits<s64>::max()};
+    const DWORD last_error = GetLastError();
+    const auto* tcb = Core::GetTcbBase();
+    SetLastError(last_error);
+    if (!tcb || !tcb->tcb_fiber || !tcb->tcb_fiber->current_fiber) {
+        return;
+    }
+    const auto* fiber = tcb->tcb_fiber->current_fiber;
+    const auto stack_low = reinterpret_cast<s64>(fiber->addr_context);
+    const auto stack_high = stack_low + static_cast<s64>(fiber->size_context);
+    const auto handler_sp = t_handler_entry_sp;
+    if (!stack_low || handler_sp < stack_low - 0x10000 || handler_sp > stack_high) {
+        return;
+    }
+    const s64 headroom = handler_sp - stack_low;
+    s64 prev = min_headroom.load(std::memory_order_relaxed);
+    while (headroom < prev && !min_headroom.compare_exchange_weak(prev, headroom)) {
+    }
+    if (headroom < prev) {
+        LOG_WARNING(Debug,
+                    "Exception {:#x} on fiber '{}' (size {:#x}): guest rsp headroom {:#x}, "
+                    "handler headroom {} bytes",
+                    pExp->ExceptionRecord->ExceptionCode, fiber->name, fiber->size_context,
+                    static_cast<s64>(pExp->ContextRecord->Rsp) - stack_low, headroom);
+    }
+}
+
+static void TrackStackPageWriteFaults(const EXCEPTION_POINTERS* pExp) noexcept {
+    const auto* record = pExp->ExceptionRecord;
+    if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION ||
+        record->ExceptionInformation[0] != 1) {
+        return;
+    }
+    const s64 fault = static_cast<s64>(record->ExceptionInformation[1]);
+    const s64 rsp = static_cast<s64>(pExp->ContextRecord->Rsp);
+    if (fault < rsp - 0x2000 || fault > rsp + 0x4000) {
+        return;
+    }
+    static std::atomic<u64> count{0};
+    const u64 n = count.fetch_add(1) + 1;
+    if (n <= 20 || std::has_single_bit(n)) {
+        const auto* tcb = Core::GetTcbBase();
+        const bool on_fiber = tcb && tcb->tcb_fiber && tcb->tcb_fiber->current_fiber;
+        LOG_WARNING(Debug,
+                    "Write fault on own stack #{}: fault {:#x} = rsp{:+#x}, rip {}, fiber {}", n,
+                    fault, fault - rsp,
+                    Diagnostics::DescribeAddress(reinterpret_cast<u64>(record->ExceptionAddress)),
+                    on_fiber ? tcb->tcb_fiber->current_fiber->name : "-");
+    }
+}
+
+static LONG HandleException(EXCEPTION_POINTERS* pExp) noexcept {
     using namespace Libraries::Kernel;
     const auto* signals = Signals::Instance();
+    TrackFiberStackHeadroom(pExp);
+    {
+        const DWORD last_error = GetLastError();
+        TrackStackPageWriteFaults(pExp);
+        SetLastError(last_error);
+    }
+    if (static std::atomic_flag announced;
+        t_exception_stack.Contains(reinterpret_cast<uintptr_t>(&pExp)) &&
+        !announced.test_and_set()) {
+        LOG_INFO(Debug, "Handling exceptions from foreign stacks on a {} KiB exception stack",
+                 ExceptionStack::Size / 1_KB);
+    }
 
     const bool use_static_windows_guest_red_zone_protection =
         WindowsGuestRedZoneProtection::IsStaticPatchingEnabled();
@@ -132,6 +223,11 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
         return EXCEPTION_CONTINUE_EXECUTION;
     }
 
+    if (guest_info._si_signo != 0 && code != EXCEPTION_BREAKPOINT &&
+        code != EXCEPTION_SINGLE_STEP) {
+        Diagnostics::ReportUnhandledException(pExp, g_curthread != nullptr, guest_info._si_signo);
+    }
+
     if (guest_info._si_signo != 0) {
         if (g_curthread &&
             g_curthread->DispatchSignal(guest_info._si_signo, &guest_info, &guest_context)) {
@@ -147,6 +243,60 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     }
 
     return EXCEPTION_CONTINUE_SEARCH;
+}
+
+using PFN_ExceptionHandler = LONG (*)(EXCEPTION_POINTERS*);
+extern "C" LONG CallOnExceptionStack(PFN_ExceptionHandler handler, EXCEPTION_POINTERS* pExp,
+                                     void* stack_top);
+
+asm(R"(
+.att_syntax prefix
+.text
+.global CallOnExceptionStack
+CallOnExceptionStack:
+    pushq %rbp
+    movq %rsp, %rbp
+    movq %r8, %rsp
+    andq $-16, %rsp
+    subq $32, %rsp
+    movq %rcx, %rax
+    movq %rdx, %rcx
+    callq *%rax
+    movq %rbp, %rsp
+    popq %rbp
+    retq
+)");
+
+static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
+    const auto sp = reinterpret_cast<uintptr_t>(&pExp);
+    t_handler_entry_sp = static_cast<s64>(sp);
+
+    ULONG_PTR thread_stack_low, thread_stack_high;
+    GetCurrentThreadStackLimits(&thread_stack_low, &thread_stack_high);
+    auto& stack = t_exception_stack;
+    if ((sp >= thread_stack_low && sp < thread_stack_high) || stack.Contains(sp)) {
+        return HandleException(pExp);
+    }
+
+    if (!stack.base) {
+        const DWORD last_error = GetLastError();
+        stack.base = static_cast<u8*>(
+            VirtualAlloc(nullptr, ExceptionStack::Size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        SetLastError(last_error);
+        if (!stack.base) {
+            return HandleException(pExp);
+        }
+    }
+
+    auto* tib = reinterpret_cast<NT_TIB*>(NtCurrentTeb());
+    void* const saved_stack_base = tib->StackBase;
+    void* const saved_stack_limit = tib->StackLimit;
+    tib->StackBase = stack.Top();
+    tib->StackLimit = stack.base;
+    const LONG result = CallOnExceptionStack(HandleException, pExp, stack.Top());
+    tib->StackBase = saved_stack_base;
+    tib->StackLimit = saved_stack_limit;
+    return result;
 }
 
 #else

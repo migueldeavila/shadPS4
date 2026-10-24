@@ -5,6 +5,7 @@
 
 #include "common/elf_info.h"
 #include "common/logging/log.h"
+#include "core/diagnostics.h"
 #include "core/libraries/fiber/fiber_error.h"
 #include "core/libraries/libs.h"
 #include "core/tls.h"
@@ -61,6 +62,8 @@ s32 PS4_SYSV_ABI _sceFiberAttachContext(OrbisFiber* fiber, void* addr_context, u
     fiber->size_context = size_context;
     fiber->context_start = addr_context;
     fiber->context_end = reinterpret_cast<u8*>(addr_context) + size_context;
+    Core::Diagnostics::RegisterGuestStack(reinterpret_cast<u64>(addr_context), size_context,
+                                          fiber->name);
 
     /* Apply signature to start of stack */
     *(u64*)addr_context = kFiberStackSignature;
@@ -207,6 +210,8 @@ s32 PS4_SYSV_ABI sceFiberInitializeImpl(OrbisFiber* fiber, const char* name, Orb
     if (addr_context != nullptr) {
         fiber->context_start = addr_context;
         fiber->context_end = reinterpret_cast<u8*>(addr_context) + size_context;
+        Core::Diagnostics::RegisterGuestStack(reinterpret_cast<u64>(addr_context), size_context,
+                                              fiber->name);
 
         /* Apply signature to start of stack */
         *(u64*)addr_context = kFiberStackSignature;
@@ -254,6 +259,9 @@ s32 PS4_SYSV_ABI sceFiberFinalize(OrbisFiber* fiber) {
         return ORBIS_FIBER_ERROR_STATE;
     }
 
+    if (fiber->addr_context) {
+        Core::Diagnostics::UnregisterGuestStack(reinterpret_cast<u64>(fiber->addr_context));
+    }
     return ORBIS_OK;
 }
 

@@ -31,6 +31,7 @@
 #include "core/cpu_patches.h" // Windows static guest red-zone protection
 #include "core/debugger.h"
 #include "core/devtools/widget/module_list.h"
+#include "core/diagnostics.h"
 #include "core/emulator_settings.h"
 #include "core/emulator_state.h"
 #include "core/file_format/psf.h"
@@ -710,6 +711,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
         });
     }
 
+    Core::Diagnostics::StartWatchdog();
     linker->Execute(args);
 
     window->InitTimers();

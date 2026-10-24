@@ -999,6 +999,8 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/debugger.h
          src/core/linker.cpp
          src/core/linker.h
+         src/core/diagnostics.cpp
+         src/core/diagnostics.h
          src/core/memory.cpp
          src/core/memory.h
          src/core/module.cpp

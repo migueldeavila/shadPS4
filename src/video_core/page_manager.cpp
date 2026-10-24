@@ -11,6 +11,7 @@
 #include "common/multi_level_page_table.h"
 #include "common/signal_context.h"
 #include "common/thread.h"
+#include "core/diagnostics.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "core/signals.h"
@@ -428,6 +429,9 @@ struct SignalImpl : public PageManager::Impl {
         auto& impl = memory->GetAddressSpace();
         ASSERT_MSG(perms != Core::MemoryPermission::Write,
                    "Attempted to protect region as write-only which is not a valid permission");
+        if (False(perms & Core::MemoryPermission::Write)) {
+            Core::Diagnostics::CheckProtectOverlapsGuestStack(address, size);
+        }
         impl.Protect(address, size, perms);
     }
 

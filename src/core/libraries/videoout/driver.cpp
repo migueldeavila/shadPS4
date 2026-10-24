@@ -5,6 +5,7 @@
 #include "common/debug.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
+#include "core/diagnostics.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/videoout/driver.h"
@@ -239,6 +240,7 @@ void VideoOutDriver::Flip(const Request& req) {
 
     // Present the frame.
     presenter->Present(req.frame);
+    Core::Diagnostics::NotifyFlip();
 
     // Update flip status.
     auto* port = req.port;

@@ -29,6 +29,7 @@ using namespace Xbyak::util;
 
 static Xbyak::CodeGenerator g_srt_codegen(32_MB);
 static const u8* g_srt_codegen_start = nullptr;
+static thread_local u32 g_srt_offset_failures = 0;
 
 namespace Shader {
 
@@ -595,6 +596,7 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
 
     if (!PushPtr(c, pass_info, off_dw)) {
         LOG_ERROR(Render_Recompiler, "Failed to compute offset for SRT walker");
+        ++g_srt_offset_failures;
         return;
     }
     PassInfo::PtrUserList* use_list = pass_info.GetUsesAsPointer(subtree);
@@ -611,6 +613,7 @@ static void VisitPointer(const IR::Value& off_dw, IR::Inst* subtree, PassInfo& p
         } else {
             if (!ComputeOffset(c, r10d, pass_info, src_off_dw)) {
                 LOG_ERROR(Render_Recompiler, "Failed to compute offset for SRT walker");
+                ++g_srt_offset_failures;
                 continue;
             }
             c.shl(r10d, 2);
@@ -653,8 +656,13 @@ static void GenerateSrtProgram(Info& info, PassInfo& pass_info) {
     pass_info.dst_off_dw = NUM_USER_DATA_REGS;
     ASSERT(pass_info.dst_off_dw == info.srt_info.flattened_bufsize_dw);
 
+    g_srt_offset_failures = 0;
     for (const auto& [sgpr_base, root] : pass_info.srt_roots) {
         VisitPointer(IR::Value(static_cast<u32>(sgpr_base)), root, pass_info, c);
+    }
+    if (g_srt_offset_failures != 0) {
+        LOG_ERROR(Render_Recompiler, "SRT walker for {} shader {:#018x}: {} offsets not computed",
+                  info.hw_stage, info.pgm_hash, g_srt_offset_failures);
     }
 
     c.ret();
