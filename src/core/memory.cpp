@@ -6,6 +6,7 @@
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
+#include "core/diagnostics.h"
 #include "core/emulator_settings.h"
 #include "core/file_sys/fs.h"
 #include "core/libraries/kernel/memory.h"
@@ -528,6 +529,9 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
                   total_flexible_size - flexible_usage, size);
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
+    if (True(flags & MemoryMapFlags::Fixed)) {
+        Core::Diagnostics::CheckGuestMemoryChange(virtual_addr, size, "MapMemory(Fixed)");
+    }
     std::scoped_lock lk{unmap_mutex};
 
     PhysHandle dmem_area;
@@ -828,6 +832,7 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
 }
 
 s32 MemoryManager::PoolDecommit(VAddr virtual_addr, u64 size) {
+    Core::Diagnostics::CheckGuestMemoryChange(virtual_addr, size, "PoolDecommit");
     std::scoped_lock lk{unmap_mutex};
     ASSERT_MSG(IsValidMapping(virtual_addr, size), "Attempted to access invalid address {:#x}",
                virtual_addr);
@@ -917,6 +922,7 @@ s32 MemoryManager::UnmapMemory(VAddr virtual_addr, u64 size) {
     if (size == 0) {
         return ORBIS_OK;
     }
+    Core::Diagnostics::CheckGuestMemoryChange(virtual_addr, size, "UnmapMemory");
 
     std::scoped_lock lk{unmap_mutex};
     // Align address and size appropriately
@@ -1122,6 +1128,9 @@ s32 MemoryManager::Protect(VAddr addr, u64 size, MemoryProt prot) {
     // If size is zero, then there's nothing to protect
     if (size == 0) {
         return ORBIS_OK;
+    }
+    if (False(prot & MemoryProt::CpuWrite)) {
+        Core::Diagnostics::CheckGuestMemoryChange(addr, size, "Protect(no write)");
     }
 
     // Ensure the range to modify is valid

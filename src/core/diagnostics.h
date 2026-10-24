@@ -4,6 +4,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 #include "common/types.h"
 
 namespace Core::Diagnostics {
@@ -21,5 +22,14 @@ void RegisterGuestStack(u64 base, u64 size, std::string_view name);
 void UnregisterGuestStack(u64 base);
 
 void CheckProtectOverlapsGuestStack(u64 address, u64 size);
+
+void CheckGuestMemoryChange(u64 address, u64 size, std::string_view operation);
+
+struct GuestStackRange {
+    u64 begin;
+    u64 end;
+};
+
+std::vector<GuestStackRange> GuestStackRangesIn(u64 address, u64 size);
 
 } // namespace Core::Diagnostics

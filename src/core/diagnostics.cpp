@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <thread>
 #include <vector>
@@ -348,30 +349,68 @@ void UnregisterGuestStack(u64 base) {
     g_guest_stacks.erase(base);
 }
 
-void CheckProtectOverlapsGuestStack(u64 address, u64 size) {
-    static std::atomic<u64> overlap_count{0};
+static bool ShouldLogOccurrence(std::atomic<u64>& counter, u64& n) {
+    n = counter.fetch_add(1) + 1;
+    return n <= 30 || std::has_single_bit(n);
+}
+
+static std::optional<std::string> FindOverlappingGuestStack(u64 address, u64 size) {
     std::shared_lock lock{g_guest_stacks_mutex};
-    if (g_guest_stacks.empty()) {
-        return;
-    }
     auto it = g_guest_stacks.upper_bound(address + size - 1);
-    while (it != g_guest_stacks.begin()) {
-        --it;
-        const u64 stack_end = it->first + it->second.size;
-        if (stack_end <= address) {
-            if (address - stack_end > 16_MB) {
-                break;
-            }
-            continue;
-        }
-        const u64 n = overlap_count.fetch_add(1) + 1;
-        if (n <= 30 || std::has_single_bit(n)) {
+    if (it == g_guest_stacks.begin()) {
+        return std::nullopt;
+    }
+    --it;
+    const u64 stack_end = it->first + it->second.size;
+    if (stack_end <= address) {
+        return std::nullopt;
+    }
+    return fmt::format("'{}' [{:#x}, {:#x})", it->second.name, it->first, stack_end);
+}
+
+void CheckProtectOverlapsGuestStack(u64 address, u64 size) {
+    static std::atomic<u64> count{0};
+    if (const auto stack = FindOverlappingGuestStack(address, size)) {
+        if (u64 n; ShouldLogOccurrence(count, n)) {
             LOG_WARNING(Debug,
-                        "Write-protecting [{:#x}, {:#x}) overlaps guest stack '{}' [{:#x}, "
-                        "{:#x}) (#{})",
-                        address, address + size, it->second.name, it->first, stack_end, n);
+                        "Left guest stack {} writable while write-protecting [{:#x}, {:#x}) (#{})",
+                        *stack, address, address + size, n);
         }
-        return;
+    }
+}
+
+std::vector<GuestStackRange> GuestStackRangesIn(u64 address, u64 size) {
+    std::vector<GuestStackRange> ranges;
+    std::shared_lock lock{g_guest_stacks_mutex};
+    auto it = g_guest_stacks.upper_bound(address);
+    if (it != g_guest_stacks.begin()) {
+        --it;
+    }
+    for (; it != g_guest_stacks.end() && it->first < address + size; ++it) {
+        const u64 stack_end = it->first + it->second.size;
+        if (stack_end > address) {
+            ranges.push_back({it->first, stack_end});
+        }
+    }
+    return ranges;
+}
+
+void CheckGuestMemoryChange(u64 address, u64 size, std::string_view operation) {
+    static std::atomic<u64> stack_count{0};
+    static std::atomic<u64> own_sp_count{0};
+    const u64 sp = reinterpret_cast<u64>(&address);
+    if (sp >= address && sp < address + size) {
+        if (u64 n; ShouldLogOccurrence(own_sp_count, n)) {
+            LOG_ERROR(Debug,
+                      "{} [{:#x}, {:#x}) contains the calling thread's stack pointer {:#x} (#{})",
+                      operation, address, address + size, sp, n);
+        }
+    }
+    if (const auto stack = FindOverlappingGuestStack(address, size)) {
+        if (u64 n; ShouldLogOccurrence(stack_count, n)) {
+            LOG_ERROR(Debug, "{} [{:#x}, {:#x}) overlaps registered guest stack {} (#{})",
+                      operation, address, address + size, *stack, n);
+        }
     }
 }
 

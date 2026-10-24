@@ -430,9 +430,30 @@ struct SignalImpl : public PageManager::Impl {
         ASSERT_MSG(perms != Core::MemoryPermission::Write,
                    "Attempted to protect region as write-only which is not a valid permission");
         if (False(perms & Core::MemoryPermission::Write)) {
-            Core::Diagnostics::CheckProtectOverlapsGuestStack(address, size);
+            ProtectSkippingGuestStacks(impl, address, size, perms);
+            return;
         }
         impl.Protect(address, size, perms);
+    }
+
+    static void ProtectSkippingGuestStacks(Core::AddressSpace& impl, VAddr address, size_t size,
+                                           Core::MemoryPermission perms) {
+        VAddr cursor = address;
+        const VAddr end = address + size;
+        for (const auto& stack : Core::Diagnostics::GuestStackRangesIn(address, size)) {
+            const VAddr skip_begin =
+                std::max(cursor, Common::AlignDown(stack.begin, PageManager::PM_PAGE_SIZE));
+            const VAddr skip_end =
+                std::min(end, Common::AlignUp(stack.end, PageManager::PM_PAGE_SIZE));
+            if (skip_begin > cursor) {
+                impl.Protect(cursor, skip_begin - cursor, perms);
+            }
+            Core::Diagnostics::CheckProtectOverlapsGuestStack(address, size);
+            cursor = std::max(cursor, skip_end);
+        }
+        if (cursor < end) {
+            impl.Protect(cursor, end - cursor, perms);
+        }
     }
 
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {

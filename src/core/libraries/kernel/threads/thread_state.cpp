@@ -4,6 +4,7 @@
 #include <boost/container/small_vector.hpp>
 #include "common/alignment.h"
 #include "common/scope_exit.h"
+#include "core/diagnostics.h"
 #include "core/libraries/kernel/posix_error.h"
 #include "core/libraries/kernel/threads/pthread.h"
 #include "core/libraries/kernel/threads/sleepq.h"
@@ -41,6 +42,7 @@ void ThreadState::Collect(Pthread* curthread) {
                 ++it;
                 continue;
             }
+            Core::Diagnostics::UnregisterGuestStack(reinterpret_cast<u64>(td->attr.stackaddr_attr));
             FreeStack(&td->attr);
             work_list.push_back(td);
             it = gc_list.erase(it);
