@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <fmt/ranges.h>
 #include "common/debug.h"
 #include "core/debug_state.h"
 #include "core/diagnostics.h"
@@ -907,6 +908,37 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         const auto data_fmt = tsharp.GetDataFmt();
         const auto num_fmt = tsharp.GetNumberFmt();
         if (tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid) {
+            if (Core::Diagnostics::IsFrameTraceActive()) {
+                const auto& fetch = image_desc.sharp_fetch;
+                AmdGpu::Image raw{};
+                const bool fetched = image_desc.Fetch(stage.flattened_ud_buf.data(), &raw);
+                std::array<u32, sizeof(raw) / sizeof(u32)> words{};
+                std::memcpy(words.data(), &raw, sizeof(raw));
+                LOG_INFO(Render,
+                         "[trace]   tex stage={:#x} NULL summary={} off0={} mask={:#x} "
+                         "fetched={} flatbuf_dw={} raw={:08x}",
+                         stage.pgm_hash, static_cast<u32>(fetch.summary), fetch.offsets[0],
+                         fetch.load_mask, fetched, stage.flattened_ud_buf.size(),
+                         fmt::join(words, " "));
+                if (stage.flattened_ud_buf.size() <= 64) {
+                    LOG_INFO(Render, "[trace]     flatbuf={:08x}",
+                             fmt::join(stage.flattened_ud_buf, " "));
+                    const auto& buf = stage.flattened_ud_buf;
+                    for (u32 i = 0; i + 1 < buf.size(); i += 2) {
+                        const VAddr ptr = (u64(buf[i + 1]) << 32 | buf[i]) & 0xFFFFFFFFFFFFULL;
+                        std::array<u32, 16> mem{};
+                        if (ptr < 0x200000000ULL || ptr >= 0x1000000000ULL || (ptr & 3) ||
+                            !Core::Diagnostics::SafeRead(ptr, mem.data(), sizeof(mem))) {
+                            continue;
+                        }
+                        LOG_INFO(Render,
+                                 "[trace]     ptr@dw{}={:#x} gpu_modified={} cpu_modified={} "
+                                 "mem={:08x}",
+                                 i, ptr, buffer_cache.IsRegionGpuModified(ptr, 64),
+                                 buffer_cache.IsRegionCpuModified(ptr, 64), fmt::join(mem, " "));
+                    }
+                }
+            }
             image_bindings[num_images++].image_id = {};
             image_descriptor_array_sizes.push_back(1);
             continue;

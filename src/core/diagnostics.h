@@ -19,6 +19,8 @@ u32 NextFrameTraceIndex();
 
 std::string DescribeAddress(u64 address);
 
+bool SafeRead(u64 address, void* out, u64 size);
+
 void ReportUnhandledException(void* exception_pointers, bool guest_thread, s32 guest_signal);
 
 void RegisterGuestStack(u64 base, u64 size, std::string_view name);

@@ -298,6 +298,17 @@ void StartWatchdog() {
 #endif
 }
 
+bool SafeRead(u64 address, void* out, u64 size) {
+#ifdef _WIN32
+    SIZE_T read = 0;
+    return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<const void*>(address), out, size,
+                             &read) &&
+           read == size;
+#else
+    return false;
+#endif
+}
+
 void NotifyFlip() {
     const u64 flip = g_flip_count.fetch_add(1, std::memory_order_relaxed) + 1;
     if (g_frame_trace_active.exchange(false)) {
@@ -316,7 +327,13 @@ bool IsFrameTraceActive() {
 }
 
 u32 NextFrameTraceIndex() {
-    return g_frame_trace_index.fetch_add(1, std::memory_order_relaxed);
+    constexpr u32 MaxTracedCommands = 2000;
+    const u32 index = g_frame_trace_index.fetch_add(1, std::memory_order_relaxed);
+    if (index + 1 == MaxTracedCommands && g_frame_trace_active.exchange(false)) {
+        LOG_INFO(Debug, "[trace] stopped after {} commands without a flip", MaxTracedCommands);
+        Common::Log::Flush();
+    }
+    return index;
 }
 
 std::string DescribeAddress(u64 address) {
