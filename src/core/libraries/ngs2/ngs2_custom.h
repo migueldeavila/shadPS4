@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <array>
+#include <vector>
+
 #include "ngs2.h"
 #include "ngs2_reverb.h"
 
@@ -37,7 +40,7 @@ struct OrbisNgs2CustomChorusModuleOption {
 
     u32 maxPhases;
     u32 reserved;
-} OrbisNgs2CustomChorusModuleOption;
+};
 
 struct OrbisNgs2CustomPeakMeterModuleOption {
     OrbisNgs2CustomModuleOption customModuleOption;
@@ -308,7 +311,7 @@ struct OrbisNgs2CustomVoicePeakMeterParam {
     OrbisNgs2VoiceParamHeader header;
     u32 enableFlag;
     u32 reserved;
-} OrbisNgs2CustomVoicePeakMeterParam;
+};
 
 struct OrbisNgs2CustomVoiceReverbParam {
     OrbisNgs2VoiceParamHeader header;
@@ -439,6 +442,25 @@ struct OrbisNgs2CustomReverbModuleInfo {
 
     u32 reverbSize;
     u32 reserved;
+};
+
+class DelayProcessor {
+public:
+    void SetParam(const OrbisNgs2CustomVoiceDelayParam& param, u32 sampleRate);
+    void Process(std::vector<float>* channels, u32 numChannels, u32 numSamples);
+
+private:
+    std::array<std::vector<float>, ORBIS_NGS2_MAX_VOICE_CHANNELS> lines;
+    std::array<float, ORBIS_NGS2_MAX_VOICE_CHANNELS> lowpassState{};
+    std::array<u32, ORBIS_NGS2_CUSTOM_DELAY_MAX_TAPS> tapDelays{};
+    std::array<float, ORBIS_NGS2_CUSTOM_DELAY_MAX_TAPS> tapLevels{};
+    u32 numTaps = 0;
+    u32 writePosition = 0;
+    float dryLevel = 1.0f;
+    float wetLevel = 0.0f;
+    float inputLevel = 1.0f;
+    float feedbackLevel = 0.0f;
+    float lowpassCoefficient = 1.0f;
 };
 
 } // namespace Libraries::Ngs2

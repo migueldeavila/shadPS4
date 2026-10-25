@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <array>
+#include <vector>
+
 #include "ngs2.h"
 
 namespace Libraries::Ngs2 {
@@ -56,6 +59,32 @@ struct OrbisNgs2ReverbRackInfo {
     OrbisNgs2RackInfo rackInfo;
     u32 maxChannels;
     u32 reverbSize;
+};
+
+class ReverbProcessor {
+public:
+    void SetParam(const OrbisNgs2ReverbI3DL2Param& param, u32 sampleRate);
+    void Process(const std::vector<float>* input, u32 numInputChannels, std::vector<float>* output,
+                 u32 numOutputChannels, u32 numSamples);
+
+private:
+    struct Filter {
+        std::vector<float> buffer;
+        u32 position = 0;
+        float store = 0.0f;
+    };
+
+    float ProcessComb(Filter& comb, float input);
+    float ProcessAllpass(Filter& allpass, float input);
+
+    std::array<std::array<Filter, 8>, 2> combs;
+    std::array<std::array<Filter, 4>, 2> allpasses;
+    Filter preDelay;
+    float feedback = 0.0f;
+    float damping = 0.0f;
+    float wetGain = 0.0f;
+    float dryGain = 0.0f;
+    u32 sampleRate = 0;
 };
 
 } // namespace Libraries::Ngs2
