@@ -177,31 +177,24 @@ public:
 
 protected:
     s32 HandleEvent(u32 eventId) override {
-        const bool requiresSetup = eventId == ORBIS_NGS2_VOICE_EVENT_RESET ||
-                                   eventId == ORBIS_NGS2_VOICE_EVENT_RESUME_A ||
-                                   eventId == ORBIS_NGS2_VOICE_EVENT_RESUME_B;
-        if (requiresSetup && format.numChannels == 0) {
+        if (eventId == ORBIS_NGS2_VOICE_EVENT_PLAY && format.numChannels == 0) {
             DiagLog("event {} {} on voice without setup", DiagVoiceName(this), eventId);
             return ORBIS_NGS2_ERROR_UNINIT_VOICE;
         }
         switch (eventId) {
-        case ORBIS_NGS2_VOICE_EVENT_RESET:
+        case ORBIS_NGS2_VOICE_EVENT_PLAY:
             if (DiagEnabled()) {
-                DiagEnd("reset", DiagDetails());
+                DiagEnd("replay", DiagDetails());
             }
             Rewind();
-            stateFlags = ORBIS_NGS2_VOICE_STATE_FLAG_INUSE;
-            return ORBIS_OK;
-        case ORBIS_NGS2_VOICE_EVENT_RESUME_A:
-        case ORBIS_NGS2_VOICE_EVENT_RESUME_B:
-            if (DiagEnabled() && !diag.playing) {
+            stateFlags = ORBIS_NGS2_VOICE_STATE_FLAG_INUSE | ORBIS_NGS2_VOICE_STATE_FLAG_PLAYING;
+            if (DiagEnabled()) {
                 DiagStart();
                 DiagLog("start-info {} {}", DiagVoiceName(this), DiagDetails());
             }
-            stateFlags = ORBIS_NGS2_VOICE_STATE_FLAG_INUSE | ORBIS_NGS2_VOICE_STATE_FLAG_PLAYING;
             return ORBIS_OK;
         case ORBIS_NGS2_VOICE_EVENT_STOP:
-            if (numReleasePoints > 0) {
+            if (numReleasePoints > 0 && (stateFlags & ORBIS_NGS2_VOICE_STATE_FLAG_PLAYING)) {
                 StartRelease();
                 return ORBIS_OK;
             }
@@ -210,9 +203,11 @@ protected:
             }
             stateFlags = 0;
             return ORBIS_OK;
+        case ORBIS_NGS2_VOICE_EVENT_STOP_IMMEDIATE:
         case ORBIS_NGS2_VOICE_EVENT_KILL:
             if (DiagEnabled()) {
-                DiagEnd("kill", DiagDetails());
+                DiagEnd(eventId == ORBIS_NGS2_VOICE_EVENT_KILL ? "kill" : "stop-immediate",
+                        DiagDetails());
             }
             return Voice::HandleEvent(eventId);
         default:
@@ -374,12 +369,14 @@ private:
                         block.numRepeats--;
                     }
                     blockOffset = 0;
+                    superframeRemaining = 0;
                     blockSamples = 0;
                     blockSkipped = 0;
                     continue;
                 }
                 blocks.pop_front();
                 blockOffset = 0;
+                superframeRemaining = 0;
                 blockSamples = 0;
                 blockSkipped = 0;
                 continue;
@@ -391,6 +388,7 @@ private:
             if (!DecodeData(data, block.dataSize - blockOffset, frameSamples, bytesUsed)) {
                 blocks.pop_front();
                 blockOffset = 0;
+                superframeRemaining = 0;
                 blockSamples = 0;
                 blockSkipped = 0;
                 continue;
@@ -425,13 +423,15 @@ private:
         const u32 numChannels = format.numChannels;
         switch (format.waveformType) {
         case ORBIS_NGS2_WAVEFORM_TYPE_ATRAC9: {
-            const u32 frameBytes =
-                static_cast<u32>(codecInfo.superframeSize / codecInfo.framesInSuperframe);
-            if (size < frameBytes) {
+            if (superframeRemaining == 0) {
+                superframeRemaining = static_cast<u32>(codecInfo.superframeSize);
+                superframeFrame = 0;
+            }
+            if (size < superframeRemaining) {
                 return false;
             }
             int bytesUsed = 0;
-            const int result = Atrac9DecodeF32(decoder, data, static_cast<int>(frameBytes),
+            const int result = Atrac9DecodeF32(decoder, data, static_cast<int>(superframeRemaining),
                                                frameBuffer.data(), &bytesUsed, 0);
             if (result != 0) {
                 lastError =
@@ -440,8 +440,13 @@ private:
                           static_cast<u32>(result), index, blockOffset, size);
                 return false;
             }
+            u32 used = std::min(static_cast<u32>(bytesUsed), superframeRemaining);
+            if (++superframeFrame >= static_cast<u32>(codecInfo.framesInSuperframe)) {
+                used = superframeRemaining;
+            }
+            superframeRemaining -= used;
             outSamples = static_cast<u32>(codecInfo.frameSamples);
-            outBytes = frameBytes;
+            outBytes = used;
             return true;
         }
         case ORBIS_NGS2_WAVEFORM_TYPE_VAG: {
@@ -497,6 +502,7 @@ private:
         }
         readPosition = 0.0;
         blockOffset = 0;
+        superframeRemaining = 0;
         blockSamples = 0;
         blockSkipped = 0;
         numDecodedSamples = 0;
@@ -522,6 +528,7 @@ private:
         }
         readPosition = 0.0;
         blockOffset = 0;
+        superframeRemaining = 0;
         blockSamples = 0;
         blockSkipped = 0;
         numDecodedSamples = 0;
@@ -551,6 +558,8 @@ private:
 
     OrbisNgs2WaveformFormat format{};
     void* decoder = nullptr;
+    u32 superframeRemaining = 0;
+    u32 superframeFrame = 0;
     std::array<u8, ATRAC9_CONFIG_DATA_SIZE> config{};
     std::array<float, 2> vagHistory{};
     Atrac9CodecInfo codecInfo{};

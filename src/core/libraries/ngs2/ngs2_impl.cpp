@@ -4,11 +4,14 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <map>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <fmt/format.h>
 
@@ -66,11 +69,44 @@ Voice* GetVoice(OrbisNgs2Handle handle) {
 
 namespace {
 
+struct DiagWriter {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<std::string> lines;
+    std::vector<s16> capture;
+    std::FILE* file = nullptr;
+    std::FILE* captureFile = nullptr;
+    std::thread thread;
+
+    void Run() {
+        std::vector<s16> samples;
+        std::deque<std::string> pending;
+        while (true) {
+            {
+                std::unique_lock lock{mutex};
+                cv.wait(lock, [this] { return !lines.empty() || !capture.empty(); });
+                pending.swap(lines);
+                samples.swap(capture);
+            }
+            for (const auto& line : pending) {
+                std::fwrite(line.data(), 1, line.size(), file);
+            }
+            std::fflush(file);
+            if (captureFile && !samples.empty()) {
+                std::fwrite(samples.data(), sizeof(s16), samples.size(), captureFile);
+                std::fflush(captureFile);
+            }
+            pending.clear();
+            samples.clear();
+        }
+    }
+};
+
 struct DiagState {
     bool initialized = false;
     bool enabled = false;
-    std::FILE* file = nullptr;
-    std::FILE* capture = nullptr;
+    DiagWriter* writer = nullptr;
+    std::array<s16, 2 * 1024> stereo{};
     u64 captureFrames = 0;
     std::chrono::steady_clock::time_point start;
     std::map<std::pair<u32, u32>, u32> paramCounts;
@@ -137,12 +173,16 @@ void DiagInit() {
     if (!std::filesystem::exists(logDir / "ngs2_diag", ec)) {
         return;
     }
-    g_diag.file = std::fopen((logDir / "ngs2_diag.txt").string().c_str(), "wb");
-    if (!g_diag.file) {
+    std::FILE* file = std::fopen((logDir / "ngs2_diag.txt").string().c_str(), "wb");
+    if (!file) {
         LOG_ERROR(Lib_Ngs2, "Unable to open NGS2 diagnostics file");
         return;
     }
-    g_diag.capture = std::fopen((logDir / "ngs2_capture.raw").string().c_str(), "wb");
+    g_diag.writer = new DiagWriter();
+    g_diag.writer->file = file;
+    g_diag.writer->captureFile = std::fopen((logDir / "ngs2_capture.raw").string().c_str(), "wb");
+    g_diag.writer->thread = std::thread([writer = g_diag.writer] { writer->Run(); });
+    g_diag.writer->thread.detach();
     g_diag.start = std::chrono::steady_clock::now();
     g_diag.enabled = true;
     LOG_INFO(Lib_Ngs2, "NGS2 diagnostics enabled");
@@ -151,13 +191,17 @@ void DiagInit() {
 }
 
 void DiagWrite(std::string_view line) {
-    if (!g_diag.file) {
+    if (!g_diag.writer) {
         return;
     }
     const double seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - g_diag.start).count();
-    fmt::print(g_diag.file, "[{:9.3f}] {}\n", seconds, line);
-    std::fflush(g_diag.file);
+    std::string text = fmt::format("[{:9.3f}] {}\n", seconds, line);
+    {
+        std::scoped_lock lock{g_diag.writer->mutex};
+        g_diag.writer->lines.push_back(std::move(text));
+    }
+    g_diag.writer->cv.notify_one();
 }
 
 std::string DiagVoiceName(const Voice* voice) {
@@ -220,7 +264,8 @@ void Voice::DiagEnd(std::string_view reason, std::string_view details) {
 void DiagRender(System* system, const OrbisNgs2RenderBufferInfo* bufferInfo, u32 numBufferInfo,
                 u32 numSamples, u32 numActiveVoices) {
     constexpr u32 PcmF32L = 0x18;
-    std::array<s16, 2 * 1024> stereo{};
+    auto& stereo = g_diag.stereo;
+    std::fill_n(stereo.begin(), numSamples * 2, s16{0});
     bool hasCapture = false;
     for (u32 i = 0; i < numBufferInfo; i++) {
         const auto& info = bufferInfo[i];
@@ -251,9 +296,13 @@ void DiagRender(System* system, const OrbisNgs2RenderBufferInfo* bufferInfo, u32
         }
     }
     g_diag.bufferSamples += numSamples;
-    if (hasCapture && g_diag.capture &&
-        g_diag.captureFrames < DiagMaxCaptureSeconds * system->sampleRate) {
-        std::fwrite(stereo.data(), sizeof(s16), numSamples * 2, g_diag.capture);
+    if (hasCapture && g_diag.captureFrames < DiagMaxCaptureSeconds * system->sampleRate) {
+        {
+            std::scoped_lock lock{g_diag.writer->mutex};
+            g_diag.writer->capture.insert(g_diag.writer->capture.end(), stereo.begin(),
+                                          stereo.begin() + numSamples * 2);
+        }
+        g_diag.writer->cv.notify_one();
         g_diag.captureFrames += numSamples;
     }
 
@@ -354,17 +403,17 @@ void Voice::GetState(void* outState, size_t stateSize) {
 
 s32 Voice::HandleEvent(u32 eventId) {
     switch (eventId) {
-    case ORBIS_NGS2_VOICE_EVENT_RESET:
+    case ORBIS_NGS2_VOICE_EVENT_PLAY:
         return ORBIS_OK;
     case ORBIS_NGS2_VOICE_EVENT_PAUSE:
         stateFlags |= ORBIS_NGS2_VOICE_STATE_FLAG_PAUSED;
         return ORBIS_OK;
     case ORBIS_NGS2_VOICE_EVENT_STOP:
+    case ORBIS_NGS2_VOICE_EVENT_STOP_IMMEDIATE:
     case ORBIS_NGS2_VOICE_EVENT_KILL:
         stateFlags = 0;
         return ORBIS_OK;
-    case ORBIS_NGS2_VOICE_EVENT_RESUME_A:
-    case ORBIS_NGS2_VOICE_EVENT_RESUME_B:
+    case ORBIS_NGS2_VOICE_EVENT_RESUME:
         stateFlags &= ~ORBIS_NGS2_VOICE_STATE_FLAG_PAUSED;
         return ORBIS_OK;
     default:
