@@ -6,7 +6,9 @@
 #include <array>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
+#include <fmt/format.h>
 #include "common/types.h"
 
 namespace Libraries::Ngs2 {
@@ -136,6 +138,9 @@ public:
     virtual void Render(u32 numSamples) = 0;
     virtual u32 NumInputChannels() const = 0;
     virtual u32 NumOutputChannels() const = 0;
+    virtual s32 OutputId() const {
+        return -1;
+    }
     bool IsActive() const {
         return (stateFlags & ORBIS_NGS2_VOICE_STATE_FLAG_INUSE) &&
                !(stateFlags & ORBIS_NGS2_VOICE_STATE_FLAG_PAUSED);
@@ -159,6 +164,18 @@ public:
     std::vector<std::vector<float>> input;
     std::array<std::vector<float>, MaxChannels> output;
     u32 visitMark = 0;
+
+    struct DiagStats {
+        u32 playId = 0;
+        u64 grains = 0;
+        u64 audibleGrains = 0;
+        float peakOut = 0.0f;
+        float maxSendGain = 0.0f;
+        bool playing = false;
+    };
+    DiagStats diag;
+    void DiagStart();
+    void DiagEnd(std::string_view reason, std::string_view details);
 
 protected:
     virtual s32 HandleEvent(u32 eventId);
@@ -211,6 +228,22 @@ private:
     std::array<LevelStats, 4> levelStats{};
     u32 levelStatsRenders = 0;
 };
+
+bool DiagEnabled();
+void DiagInit();
+void DiagWrite(std::string_view line);
+std::string DiagVoiceName(const Voice* voice);
+std::string DiagRoute(const Voice* voice);
+void DiagParam(const Voice* voice, const OrbisNgs2VoiceParamHeader* param, std::string_view what);
+void DiagRender(System* system, const OrbisNgs2RenderBufferInfo* bufferInfo, u32 numBufferInfo,
+                u32 numSamples, u32 numActiveVoices);
+
+template <typename... Args>
+void DiagLog(fmt::format_string<Args...> format, Args&&... args) {
+    if (DiagEnabled()) {
+        DiagWrite(fmt::format(format, std::forward<Args>(args)...));
+    }
+}
 
 std::recursive_mutex& GetMutex();
 

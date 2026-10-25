@@ -40,6 +40,7 @@ public:
             }
             numInputChannels = p->numInputChannels;
             stateFlags = ORBIS_NGS2_VOICE_STATE_FLAG_INUSE;
+            DiagLog("setup {} in {}", DiagVoiceName(this), numInputChannels);
             return ORBIS_OK;
         }
         case ORBIS_NGS2_MASTERING_VOICE_PARAM_GAIN: {
@@ -57,14 +58,17 @@ public:
         case ORBIS_NGS2_MASTERING_VOICE_PARAM_OUTPUT: {
             const auto* p = reinterpret_cast<const OrbisNgs2MasteringVoiceOutputParam*>(param);
             outputId = p->outputId;
+            DiagLog("output {} -> buffer {}", DiagVoiceName(this), outputId);
             return ORBIS_OK;
         }
         case ORBIS_NGS2_MASTERING_VOICE_PARAM_MATRIX:
         case ORBIS_NGS2_MASTERING_VOICE_PARAM_LFE:
         case ORBIS_NGS2_MASTERING_VOICE_PARAM_PEAK_METER:
+            DiagParam(this, param, "ignored");
             return ORBIS_OK;
         default:
             LOG_ERROR(Lib_Ngs2, "Unhandled mastering param {:#x}", param->id);
+            DiagParam(this, param, "unhandled");
             return ORBIS_NGS2_ERROR_INVALID_VOICE_CONTROL_ID;
         }
     }
@@ -108,6 +112,10 @@ public:
 
     u32 NumOutputChannels() const override {
         return 0;
+    }
+
+    s32 OutputId() const override {
+        return static_cast<s32>(outputId);
     }
 
 private:

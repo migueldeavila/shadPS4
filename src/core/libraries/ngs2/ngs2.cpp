@@ -31,6 +31,7 @@ s32 HandleReportInvalid(OrbisNgs2Handle handle, u32 handleType) {
         return ORBIS_NGS2_ERROR_INVALID_RACK_HANDLE;
     case 4:
         LOG_ERROR(Lib_Ngs2, "Invalid voice handle {:#x}", handle);
+        DiagLog("invalid voice handle {:#x}", handle);
         return ORBIS_NGS2_ERROR_INVALID_VOICE_HANDLE;
     default:
         LOG_ERROR(Lib_Ngs2, "Invalid handle {:#x}", handle);
@@ -410,6 +411,7 @@ s32 PS4_SYSV_ABI sceNgs2VoiceControl(OrbisNgs2Handle voiceHandle,
         }
         if (const s32 result = voice->Control(param); result < 0) {
             LOG_ERROR(Lib_Ngs2, "param {:#x} failed: {:#x}", param->id, static_cast<u32>(result));
+            DiagParam(voice, param, fmt::format("failed {:#x}", static_cast<u32>(result)));
             return result;
         }
         if (param->next == 0) {

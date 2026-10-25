@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstring>
 #include <deque>
+#include <string>
 
 #include "ngs2_error.h"
 #include "ngs2_impl.h"
@@ -92,10 +93,11 @@ public:
         case ORBIS_NGS2_SAMPLER_VOICE_PARAM_PEAK_METER:
         case ORBIS_NGS2_SAMPLER_VOICE_PARAM_FILTER:
         case ORBIS_NGS2_SAMPLER_VOICE_PARAM_NUM_FILTERS:
-            LOG_DEBUG(Lib_Ngs2, "Ignored sampler param {:#x}", param->id);
+            DiagParam(this, param, "ignored");
             return ORBIS_OK;
         default:
             LOG_ERROR(Lib_Ngs2, "Unhandled sampler param {:#x}", param->id);
+            DiagParam(this, param, "unhandled");
             return ORBIS_NGS2_ERROR_INVALID_VOICE_CONTROL_ID;
         }
     }
@@ -158,6 +160,9 @@ public:
         if (written < numSamples || envelopeFinished) {
             LOG_DEBUG(Lib_Ngs2, "sampler voice {} finished: decoded {} samples, {} bytes", index,
                       numDecodedSamples, decodedDataSize);
+            if (DiagEnabled()) {
+                DiagEnd(envelopeFinished ? "release-done" : "data-end", DiagDetails());
+            }
             stateFlags = 0;
         }
     }
@@ -176,15 +181,23 @@ protected:
                                    eventId == ORBIS_NGS2_VOICE_EVENT_RESUME_A ||
                                    eventId == ORBIS_NGS2_VOICE_EVENT_RESUME_B;
         if (requiresSetup && format.numChannels == 0) {
+            DiagLog("event {} {} on voice without setup", DiagVoiceName(this), eventId);
             return ORBIS_NGS2_ERROR_UNINIT_VOICE;
         }
         switch (eventId) {
         case ORBIS_NGS2_VOICE_EVENT_RESET:
+            if (DiagEnabled()) {
+                DiagEnd("reset", DiagDetails());
+            }
             Rewind();
             stateFlags = ORBIS_NGS2_VOICE_STATE_FLAG_INUSE;
             return ORBIS_OK;
         case ORBIS_NGS2_VOICE_EVENT_RESUME_A:
         case ORBIS_NGS2_VOICE_EVENT_RESUME_B:
+            if (DiagEnabled() && !diag.playing) {
+                DiagStart();
+                DiagLog("start-info {} {}", DiagVoiceName(this), DiagDetails());
+            }
             stateFlags = ORBIS_NGS2_VOICE_STATE_FLAG_INUSE | ORBIS_NGS2_VOICE_STATE_FLAG_PLAYING;
             return ORBIS_OK;
         case ORBIS_NGS2_VOICE_EVENT_STOP:
@@ -192,14 +205,31 @@ protected:
                 StartRelease();
                 return ORBIS_OK;
             }
+            if (DiagEnabled()) {
+                DiagEnd("stop", DiagDetails());
+            }
             stateFlags = 0;
             return ORBIS_OK;
+        case ORBIS_NGS2_VOICE_EVENT_KILL:
+            if (DiagEnabled()) {
+                DiagEnd("kill", DiagDetails());
+            }
+            return Voice::HandleEvent(eventId);
         default:
             return Voice::HandleEvent(eventId);
         }
     }
 
 private:
+    std::string DiagDetails() const {
+        return fmt::format("type {:#x} ch {} rate {} pitch {:.3f} env {}+{} h {:.3f}{} decoded {} "
+                           "bytes {} queued {}{}",
+                           format.waveformType, format.numChannels, format.sampleRate, pitchRatio,
+                           numForwardPoints, numReleasePoints, envelopeHeight,
+                           releasing ? " releasing" : "", numDecodedSamples, decodedDataSize,
+                           blocks.size(), lastError.empty() ? "" : " error " + lastError);
+    }
+
     s32 Setup(const OrbisNgs2SamplerVoiceSetupParam* param) {
         const auto& fmt = param->format;
         if (fmt.numChannels == 0 || fmt.numChannels > MaxChannels) {
@@ -238,10 +268,20 @@ private:
                    fmt.waveformType != ORBIS_NGS2_WAVEFORM_TYPE_PCM_F32L) {
             LOG_ERROR(Lib_Ngs2, "Unsupported waveform type {:#x} channels {} rate {} config {:#x}",
                       fmt.waveformType, fmt.numChannels, fmt.sampleRate, fmt.configData);
+            DiagLog("setup {} UNSUPPORTED type {:#x} channels {} rate {} config {:#x}",
+                    DiagVoiceName(this), fmt.waveformType, fmt.numChannels, fmt.sampleRate,
+                    fmt.configData);
             return ORBIS_NGS2_ERROR_INVALID_WAVEFORM_TYPE;
         }
         LOG_DEBUG(Lib_Ngs2, "sampler voice {} setup: type {:#x} channels {} rate {} config {:#x}",
                   index, fmt.waveformType, fmt.numChannels, fmt.sampleRate, fmt.configData);
+        if (DiagEnabled()) {
+            DiagEnd("re-setup", DiagDetails());
+            DiagLog("setup {} type {:#x} channels {} rate {} config {:#x} flags {:#x}{}",
+                    DiagVoiceName(this), fmt.waveformType, fmt.numChannels, fmt.sampleRate,
+                    fmt.configData, param->flags,
+                    blocks.empty() ? "" : fmt::format(" (discarding {} blocks)", blocks.size()));
+        }
         ResetPlayback();
         stateFlags = ORBIS_NGS2_VOICE_STATE_FLAG_INUSE;
         return ORBIS_OK;
@@ -261,6 +301,15 @@ private:
                       block.numSkipSamples, block.numSamples);
             blocks.push_back({base + block.dataOffset, block.dataSize, block.numRepeats,
                               block.numSkipSamples, block.numSamples, block.userData});
+        }
+        if (DiagEnabled()) {
+            const auto* first = param->numBlocks ? &param->aBlock[0] : nullptr;
+            DiagLog("blocks {} n {} flags {:#x} data {} first(off {:#x} size {:#x} rep {} skip {} "
+                    "samples {}) queued {} playing {}",
+                    DiagVoiceName(this), param->numBlocks, param->flags, param->data,
+                    first ? first->dataOffset : 0, first ? first->dataSize : 0,
+                    first ? first->numRepeats : 0, first ? first->numSkipSamples : 0,
+                    first ? first->numSamples : 0, blocks.size(), diag.playing);
         }
         return ORBIS_OK;
     }
@@ -385,6 +434,8 @@ private:
             const int result = Atrac9DecodeF32(decoder, data, static_cast<int>(frameBytes),
                                                frameBuffer.data(), &bytesUsed, 0);
             if (result != 0) {
+                lastError =
+                    fmt::format("atrac9 {:#x} at {:#x}", static_cast<u32>(result), blockOffset);
                 LOG_ERROR(Lib_Ngs2, "ATRAC9 decode failed: {:#x} voice {} offset {:#x} size {:#x}",
                           static_cast<u32>(result), index, blockOffset, size);
                 return false;
@@ -464,6 +515,7 @@ private:
     }
 
     void ResetPlayback() {
+        lastError.clear();
         blocks.clear();
         for (auto& channel : pending) {
             channel.clear();
@@ -525,6 +577,7 @@ private:
     float envelopeHeight = 1.0f;
     bool envelopeFinished = false;
     bool releasing = false;
+    std::string lastError;
 };
 
 } // namespace

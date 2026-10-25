@@ -73,6 +73,8 @@ public:
             userFxHandler = p->handler;
             userFxData = {p->userData0, p->userData1, p->userData2};
             userFxFlags = UserFxFlagReset;
+            DiagLog("userfx {} handler {} data {:#x} {:#x} {:#x}", DiagVoiceName(this),
+                    fmt::ptr(p->handler), p->userData0, p->userData1, p->userData2);
             return ORBIS_OK;
         }
         case ORBIS_NGS2_REVERB_VOICE_PARAM_I3DL2: {
@@ -86,6 +88,7 @@ public:
         case ORBIS_NGS2_SUBMIXER_VOICE_PARAM_PEAK_METER:
         case ORBIS_NGS2_SUBMIXER_VOICE_PARAM_FILTER:
         case ORBIS_NGS2_SUBMIXER_VOICE_PARAM_NUM_FILTERS:
+            DiagParam(this, param, "ignored");
             return ORBIS_OK;
         default:
             if ((param->id & ORBIS_NGS2_CUSTOM_VOICE_PARAM_MODULE_MASK) ==
@@ -93,6 +96,7 @@ public:
                 return ControlCustomModule(param);
             }
             LOG_ERROR(Lib_Ngs2, "Unhandled submixer param {:#x}", param->id);
+            DiagParam(this, param, "unhandled");
             return ORBIS_NGS2_ERROR_INVALID_VOICE_CONTROL_ID;
         }
     }
@@ -159,13 +163,15 @@ private:
             hasDelay = true;
             return ORBIS_OK;
         }
-        LOG_DEBUG(Lib_Ngs2, "Ignored custom module param {:#x}", param->id);
+        DiagParam(this, param, "ignored");
         return ORBIS_OK;
     }
 
     void Setup(u32 numInputs, u32 numOutputs) {
         numInputChannels = numInputs;
         numOutputChannels = numOutputs;
+        DiagLog("setup {} in {} out {} maxInputs {}", DiagVoiceName(this), numInputs, numOutputs,
+                rack->maxInputs);
         stateFlags = ORBIS_NGS2_VOICE_STATE_FLAG_INUSE;
         userFxFlags = UserFxFlagReset;
     }

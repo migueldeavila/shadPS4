@@ -2,8 +2,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <map>
 #include <string>
 #include <unordered_set>
 #include <fmt/format.h>
@@ -14,6 +18,7 @@
 #include "ngs2_submixer.h"
 
 #include "common/logging/log.h"
+#include "common/path_util.h"
 #include "core/libraries/error_codes.h"
 
 namespace Libraries::Ngs2 {
@@ -57,6 +62,260 @@ Rack* GetRack(OrbisNgs2Handle handle) {
 Voice* GetVoice(OrbisNgs2Handle handle) {
     auto* voice = reinterpret_cast<Voice*>(handle);
     return g_voices.contains(voice) ? voice : nullptr;
+}
+
+namespace {
+
+struct DiagState {
+    bool initialized = false;
+    bool enabled = false;
+    std::FILE* file = nullptr;
+    std::FILE* capture = nullptr;
+    u64 captureFrames = 0;
+    std::chrono::steady_clock::time_point start;
+    std::map<std::pair<u32, u32>, u32> paramCounts;
+    u32 starts = 0;
+    u32 ends = 0;
+    u32 silentEnds = 0;
+    std::array<std::array<float, 2>, 5> rackPeaks{};
+    std::array<float, 4> bufferPeaks{};
+    std::array<double, 4> bufferSquares{};
+    u64 bufferSamples = 0;
+    u32 renders = 0;
+};
+
+DiagState g_diag;
+
+constexpr u64 DiagMaxCaptureSeconds = 20 * 60;
+constexpr u32 DiagReportSeconds = 5;
+constexpr u32 DiagMaxParamLogs = 10;
+constexpr size_t DiagMaxRouteLength = 800;
+constexpr u32 DiagMaxRouteDepth = 6;
+
+void AppendRoute(std::string& out, const Voice* voice, u32 depth) {
+    for (u32 i = 0; i < voice->ports.size(); i++) {
+        const auto& port = voice->ports[i];
+        if (!port.dest || out.size() > DiagMaxRouteLength) {
+            continue;
+        }
+        float gain = port.volume;
+        if (port.matrixId >= 0 && voice->matrixNumLevels[port.matrixId] > 0) {
+            const auto& matrix = voice->matrices[port.matrixId];
+            const u32 numLevels = voice->matrixNumLevels[port.matrixId];
+            float maxLevel = 0.0f;
+            for (u32 j = 0; j < numLevels; j++) {
+                maxLevel = std::max(maxLevel, std::abs(matrix[j]));
+            }
+            gain *= maxLevel;
+        }
+        out += fmt::format(" p{}(g{:.3f}{})->{}{}", i, gain,
+                           port.destInputId ? fmt::format(",in{}", port.destInputId) : "",
+                           DiagVoiceName(port.dest), port.dest->IsActive() ? "" : "[INACTIVE]");
+        if (port.dest->OutputId() >= 0) {
+            out += fmt::format("=>out{}", port.dest->OutputId());
+        } else if (depth < DiagMaxRouteDepth) {
+            out += " {";
+            AppendRoute(out, port.dest, depth + 1);
+            out += " }";
+        }
+    }
+}
+
+} // namespace
+
+bool DiagEnabled() {
+    return g_diag.enabled;
+}
+
+void DiagInit() {
+    if (g_diag.initialized) {
+        return;
+    }
+    g_diag.initialized = true;
+    const auto& logDir = Common::FS::GetUserPath(Common::FS::PathType::LogDir);
+    std::error_code ec;
+    if (!std::filesystem::exists(logDir / "ngs2_diag", ec)) {
+        return;
+    }
+    g_diag.file = std::fopen((logDir / "ngs2_diag.txt").string().c_str(), "wb");
+    if (!g_diag.file) {
+        LOG_ERROR(Lib_Ngs2, "Unable to open NGS2 diagnostics file");
+        return;
+    }
+    g_diag.capture = std::fopen((logDir / "ngs2_capture.raw").string().c_str(), "wb");
+    g_diag.start = std::chrono::steady_clock::now();
+    g_diag.enabled = true;
+    LOG_INFO(Lib_Ngs2, "NGS2 diagnostics enabled");
+    DiagWrite("ngs2 diagnostics; capture = ngs2_capture.raw, s16le stereo 48000 Hz, "
+              "downmix of every 8-channel render buffer");
+}
+
+void DiagWrite(std::string_view line) {
+    if (!g_diag.file) {
+        return;
+    }
+    const double seconds =
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - g_diag.start).count();
+    fmt::print(g_diag.file, "[{:9.3f}] {}\n", seconds, line);
+    std::fflush(g_diag.file);
+}
+
+std::string DiagVoiceName(const Voice* voice) {
+    return fmt::format("{:04x}:{}@{:06x}", voice->rack->rackId, voice->index,
+                       reinterpret_cast<uintptr_t>(voice) & 0xFFFFFF);
+}
+
+std::string DiagRoute(const Voice* voice) {
+    std::string route;
+    AppendRoute(route, voice, 0);
+    return route.empty() ? " (no patch)" : route;
+}
+
+void DiagParam(const Voice* voice, const OrbisNgs2VoiceParamHeader* param, std::string_view what) {
+    if (!g_diag.enabled) {
+        return;
+    }
+    const u32 count = ++g_diag.paramCounts[{voice->rack->rackId, param->id}];
+    if (count > DiagMaxParamLogs && count % 1000 != 0) {
+        return;
+    }
+    const auto* words = reinterpret_cast<const u32*>(param);
+    std::string raw;
+    for (size_t i = 2; i < std::min<size_t>(param->size, 0x80) / 4; i++) {
+        raw += fmt::format(" {:x}", words[i]);
+    }
+    DiagWrite(fmt::format("param {} {} id {:#x} size {} count {}:{}", what, DiagVoiceName(voice),
+                          param->id, param->size, count, raw));
+}
+
+void Voice::DiagStart() {
+    if (!g_diag.enabled) {
+        return;
+    }
+    const u32 playId = diag.playId + 1;
+    diag = {};
+    diag.playId = playId;
+    diag.playing = true;
+    g_diag.starts++;
+    DiagWrite(fmt::format("start {} #{} route:{}", DiagVoiceName(this), playId, DiagRoute(this)));
+}
+
+void Voice::DiagEnd(std::string_view reason, std::string_view details) {
+    if (!g_diag.enabled || !diag.playing) {
+        return;
+    }
+    diag.playing = false;
+    g_diag.ends++;
+    const bool silent = diag.audibleGrains == 0;
+    if (silent) {
+        g_diag.silentEnds++;
+    }
+    DiagWrite(fmt::format("end {} #{} reason {} grains {} audible {} peak {:.5f} maxSendGain {:.4f}"
+                          "{} {} route:{}",
+                          DiagVoiceName(this), diag.playId, reason, diag.grains, diag.audibleGrains,
+                          diag.peakOut, diag.maxSendGain, silent ? " SILENT" : "", details,
+                          DiagRoute(this)));
+}
+
+void DiagRender(System* system, const OrbisNgs2RenderBufferInfo* bufferInfo, u32 numBufferInfo,
+                u32 numSamples, u32 numActiveVoices) {
+    constexpr u32 PcmF32L = 0x18;
+    std::array<s16, 2 * 1024> stereo{};
+    bool hasCapture = false;
+    for (u32 i = 0; i < numBufferInfo; i++) {
+        const auto& info = bufferInfo[i];
+        if (info.waveformType != PcmF32L || !info.buffer || info.numChannels == 0) {
+            continue;
+        }
+        const auto* samples = static_cast<const float*>(info.buffer);
+        const u32 frames = std::min<u32>(
+            numSamples, static_cast<u32>(info.bufferSize / (sizeof(float) * info.numChannels)));
+        if (i < g_diag.bufferPeaks.size()) {
+            for (u32 j = 0; j < frames * info.numChannels; j++) {
+                g_diag.bufferPeaks[i] = std::max(g_diag.bufferPeaks[i], std::abs(samples[j]));
+                g_diag.bufferSquares[i] += static_cast<double>(samples[j]) * samples[j];
+            }
+        }
+        if (info.numChannels != MaxChannels || frames > stereo.size() / 2) {
+            continue;
+        }
+        hasCapture = true;
+        for (u32 j = 0; j < frames; j++) {
+            const float* frame = samples + j * MaxChannels;
+            const float left = frame[0] + 0.7f * (frame[2] + frame[4] + frame[6]);
+            const float right = frame[1] + 0.7f * (frame[2] + frame[5] + frame[7]);
+            stereo[j * 2] =
+                static_cast<s16>(std::clamp(stereo[j * 2] + left * 32767.0f, -32768.0f, 32767.0f));
+            stereo[j * 2 + 1] = static_cast<s16>(
+                std::clamp(stereo[j * 2 + 1] + right * 32767.0f, -32768.0f, 32767.0f));
+        }
+    }
+    g_diag.bufferSamples += numSamples;
+    if (hasCapture && g_diag.capture &&
+        g_diag.captureFrames < DiagMaxCaptureSeconds * system->sampleRate) {
+        std::fwrite(stereo.data(), sizeof(s16), numSamples * 2, g_diag.capture);
+        g_diag.captureFrames += numSamples;
+    }
+
+    if (++g_diag.renders < DiagReportSeconds * system->sampleRate / numSamples) {
+        return;
+    }
+    u32 samplerInUse = 0;
+    u32 samplerPlaying = 0;
+    for (const Rack* rack : system->racks) {
+        if (rack->rackId != ORBIS_NGS2_RACK_ID_SAMPLER) {
+            continue;
+        }
+        for (const auto& voice : rack->voices) {
+            samplerInUse += (voice->stateFlags & ORBIS_NGS2_VOICE_STATE_FLAG_INUSE) ? 1 : 0;
+            samplerPlaying += voice->diag.playing ? 1 : 0;
+        }
+    }
+    std::string report = fmt::format(
+        "summary active {} samplerInUse {} samplerPlaying {} starts {} ends {} silentEnds {} |",
+        numActiveVoices, samplerInUse, samplerPlaying, g_diag.starts, g_diag.ends,
+        g_diag.silentEnds);
+    for (u32 i = 1; i < g_diag.rackPeaks.size(); i++) {
+        report += fmt::format(" rack{}xxx in {:.4f} out {:.4f}", i, g_diag.rackPeaks[i][0],
+                              g_diag.rackPeaks[i][1]);
+    }
+    report += " |";
+    for (u32 i = 0; i < std::min<u32>(numBufferInfo, g_diag.bufferPeaks.size()); i++) {
+        const double count =
+            static_cast<double>(g_diag.bufferSamples) * std::max(bufferInfo[i].numChannels, 1u);
+        report += fmt::format(" buf{} rms {:.5f} peak {:.5f}", i,
+                              std::sqrt(g_diag.bufferSquares[i] / count), g_diag.bufferPeaks[i]);
+    }
+    DiagWrite(report);
+    g_diag.starts = g_diag.ends = g_diag.silentEnds = 0;
+    g_diag.rackPeaks = {};
+    g_diag.bufferPeaks = {};
+    g_diag.bufferSquares = {};
+    g_diag.bufferSamples = 0;
+    g_diag.renders = 0;
+}
+
+void DiagVoiceGrain(Voice* voice, u32 numSamples) {
+    float inPeak = 0.0f;
+    for (u32 ch = 0; ch < voice->NumInputChannels(); ch++) {
+        for (u32 i = 0; i < numSamples; i++) {
+            inPeak = std::max(inPeak, std::abs(voice->input[ch][i]));
+        }
+    }
+    float outPeak = 0.0f;
+    for (u32 ch = 0; ch < voice->NumOutputChannels(); ch++) {
+        for (u32 i = 0; i < numSamples; i++) {
+            outPeak = std::max(outPeak, std::abs(voice->output[ch][i]));
+        }
+    }
+    auto& peaks = g_diag.rackPeaks[std::min<u32>(voice->rack->rackId >> 12, 4)];
+    peaks[0] = std::max(peaks[0], inPeak);
+    peaks[1] = std::max(peaks[1], outPeak);
+    if (voice->diag.playing) {
+        voice->diag.grains++;
+        voice->diag.audibleGrains += outPeak > 1e-5f ? 1 : 0;
+        voice->diag.peakOut = std::max(voice->diag.peakOut, outPeak);
+    }
 }
 
 Voice::Voice(Rack* rack, u32 index) : rack(rack), index(index) {
@@ -109,6 +368,7 @@ s32 Voice::HandleEvent(u32 eventId) {
         stateFlags &= ~ORBIS_NGS2_VOICE_STATE_FLAG_PAUSED;
         return ORBIS_OK;
     default:
+        DiagLog("event {} invalid id {}", DiagVoiceName(this), eventId);
         return ORBIS_NGS2_ERROR_INVALID_EVENT_TYPE;
     }
 }
@@ -174,15 +434,25 @@ s32 Voice::Control(const OrbisNgs2VoiceParamHeader* param) {
         if (!dest || dest == this) {
             LOG_ERROR(Lib_Ngs2, "Invalid patch destination {:#x} (rack: {})", p->destHandle,
                       GetRack(p->destHandle) != nullptr);
+            DiagLog("patch {} port {} invalid destination {:#x}", DiagVoiceName(this), p->port,
+                    p->destHandle);
             return ORBIS_NGS2_ERROR_INVALID_PATCH;
         }
         ports[p->port].dest = dest;
         ports[p->port].destInputId = p->destInputId;
+        if (rack->rackId != ORBIS_NGS2_RACK_ID_SAMPLER) {
+            DiagLog("patch {} port {} -> {} input {}", DiagVoiceName(this), p->port,
+                    DiagVoiceName(dest), p->destInputId);
+        }
         return ORBIS_OK;
     }
-    case ORBIS_NGS2_VOICE_PARAM_EVENT:
-        return HandleEvent(reinterpret_cast<const OrbisNgs2VoiceEventParam*>(param)->eventId);
+    case ORBIS_NGS2_VOICE_PARAM_EVENT: {
+        const u32 eventId = reinterpret_cast<const OrbisNgs2VoiceEventParam*>(param)->eventId;
+        DiagLog("event {} {} flags {:#x}", DiagVoiceName(this), eventId, stateFlags);
+        return HandleEvent(eventId);
+    }
     case ORBIS_NGS2_VOICE_PARAM_CALLBACK:
+        DiagParam(this, param, "ignored");
         return ORBIS_OK;
     default:
         return ControlModule(param);
@@ -197,6 +467,16 @@ void Voice::MixToPorts(u32 numSamples) {
             continue;
         }
         Voice* dest = port.dest;
+        if (diag.playing) {
+            float maxLevel = 1.0f;
+            if (port.matrixId >= 0 && matrixNumLevels[port.matrixId] > 0) {
+                maxLevel = 0.0f;
+                for (u32 i = 0; i < matrixNumLevels[port.matrixId]; i++) {
+                    maxLevel = std::max(maxLevel, std::abs(matrices[port.matrixId][i]));
+                }
+            }
+            diag.maxSendGain = std::max(diag.maxSendGain, maxLevel * std::abs(port.volume));
+        }
         std::vector<float>* destInput = &dest->input[port.destInputId * MaxChannels];
         const u32 numDest = dest->NumInputChannels();
         if (numDest == 0) {
@@ -240,6 +520,9 @@ void Voice::MixToPorts(u32 numSamples) {
 
 void Voice::Process(u32 numSamples) {
     Render(numSamples);
+    if (DiagEnabled()) {
+        DiagVoiceGrain(this, numSamples);
+    }
     MixToPorts(numSamples);
 }
 
@@ -345,6 +628,9 @@ void System::Render(const OrbisNgs2RenderBufferInfo* bufferInfo, u32 numBufferIn
         voice->Process(numSamples);
     }
     UpdateLevelStats(bufferInfo, numBufferInfo, static_cast<u32>(order.size()));
+    if (DiagEnabled()) {
+        DiagRender(this, bufferInfo, numBufferInfo, numSamples, static_cast<u32>(order.size()));
+    }
     currentBuffers = nullptr;
     currentNumBuffers = 0;
     renderCount++;
@@ -379,6 +665,7 @@ s32 ValidateSystemOption(const OrbisNgs2SystemOption* option) {
 }
 
 System* CreateSystem(const OrbisNgs2SystemOption* option) {
+    DiagInit();
     auto* system = new System(option);
     g_systems.insert(system);
     return system;
@@ -402,6 +689,7 @@ s32 ValidateRackId(u32 rackId) {
         return ORBIS_OK;
     default:
         LOG_ERROR(Lib_Ngs2, "Unsupported rack id {:#x}", rackId);
+        DiagLog("unsupported rack id {:#x}", rackId);
         return ORBIS_NGS2_ERROR_INVALID_RACK_ID;
     }
 }
