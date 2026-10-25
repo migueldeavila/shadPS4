@@ -234,7 +234,8 @@ private:
             return ORBIS_NGS2_ERROR_INVALID_WAVEFORM_SAMPLE_RATE;
         }
         ReleaseDecoder();
-        format = fmt;
+        format = {};
+        stateFlags = 0;
         if (fmt.waveformType == ORBIS_NGS2_WAVEFORM_TYPE_ATRAC9) {
             for (u32 i = 0; i < ATRAC9_CONFIG_DATA_SIZE; i++) {
                 config[i] =
@@ -255,10 +256,7 @@ private:
             }
             frameBuffer.resize(static_cast<size_t>(codecInfo.frameSamples) * codecInfo.channels);
         } else if (fmt.waveformType == ORBIS_NGS2_WAVEFORM_TYPE_VAG) {
-            if (fmt.numChannels != 1) {
-                return ORBIS_NGS2_ERROR_INVALID_NUM_CHANNELS;
-            }
-            frameBuffer.resize(VagFrameSamples);
+            frameBuffer.resize(static_cast<size_t>(VagFrameSamples) * fmt.numChannels);
         } else if (fmt.waveformType != ORBIS_NGS2_WAVEFORM_TYPE_PCM_I16L &&
                    fmt.waveformType != ORBIS_NGS2_WAVEFORM_TYPE_PCM_F32L) {
             LOG_ERROR(Lib_Ngs2, "Unsupported waveform type {:#x} channels {} rate {} config {:#x}",
@@ -277,6 +275,7 @@ private:
                     fmt.configData, param->flags,
                     blocks.empty() ? "" : fmt::format(" (discarding {} blocks)", blocks.size()));
         }
+        format = fmt;
         ResetPlayback();
         stateFlags = ORBIS_NGS2_VOICE_STATE_FLAG_INUSE;
         return ORBIS_OK;
@@ -450,23 +449,28 @@ private:
             return true;
         }
         case ORBIS_NGS2_WAVEFORM_TYPE_VAG: {
-            if (size < VagFrameBytes) {
+            if (size < VagFrameBytes * numChannels) {
                 return false;
             }
-            const u32 predictor = std::min<u32>(data[0] >> 4, VagCoefficients.size() - 1);
-            const u32 shift = data[0] & 0xF;
-            const auto& coef = VagCoefficients[predictor];
-            for (u32 i = 0; i < VagFrameSamples; i++) {
-                const u8 byte = data[2 + i / 2];
-                const s32 nibble = static_cast<s16>(((i & 1) ? byte >> 4 : byte & 0xF) << 12);
-                const float sample = static_cast<float>(nibble >> shift) + vagHistory[0] * coef[0] +
-                                     vagHistory[1] * coef[1];
-                vagHistory[1] = vagHistory[0];
-                vagHistory[0] = sample;
-                frameBuffer[i] = std::clamp(sample, -32768.0f, 32767.0f) / 32768.0f;
+            for (u32 ch = 0; ch < numChannels; ch++) {
+                const u8* frame = data + ch * VagFrameBytes;
+                const u32 predictor = std::min<u32>(frame[0] >> 4, VagCoefficients.size() - 1);
+                const u32 shift = frame[0] & 0xF;
+                const auto& coef = VagCoefficients[predictor];
+                auto& history = vagHistory[ch];
+                for (u32 i = 0; i < VagFrameSamples; i++) {
+                    const u8 byte = frame[2 + i / 2];
+                    const s32 nibble = static_cast<s16>(((i & 1) ? byte >> 4 : byte & 0xF) << 12);
+                    const float sample = static_cast<float>(nibble >> shift) +
+                                         history[0] * coef[0] + history[1] * coef[1];
+                    history[1] = history[0];
+                    history[0] = sample;
+                    frameBuffer[i * numChannels + ch] =
+                        std::clamp(sample, -32768.0f, 32767.0f) / 32768.0f;
+                }
             }
             outSamples = VagFrameSamples;
-            outBytes = VagFrameBytes;
+            outBytes = VagFrameBytes * numChannels;
             return true;
         }
         case ORBIS_NGS2_WAVEFORM_TYPE_PCM_I16L:
@@ -561,7 +565,7 @@ private:
     u32 superframeRemaining = 0;
     u32 superframeFrame = 0;
     std::array<u8, ATRAC9_CONFIG_DATA_SIZE> config{};
-    std::array<float, 2> vagHistory{};
+    std::array<std::array<float, 2>, MaxChannels> vagHistory{};
     Atrac9CodecInfo codecInfo{};
     std::vector<float> frameBuffer;
     std::deque<Block> blocks;
