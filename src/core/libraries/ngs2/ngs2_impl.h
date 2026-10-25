@@ -171,6 +171,8 @@ public:
         u64 audibleGrains = 0;
         float peakOut = 0.0f;
         float maxSendGain = 0.0f;
+        u32 matrixUpdates = 0;
+        float maxMatrixLevel = 0.0f;
         bool playing = false;
     };
     DiagStats diag;
@@ -230,6 +232,7 @@ private:
 };
 
 bool DiagEnabled();
+void DiagSetCaller(uintptr_t caller);
 void DiagInit();
 void DiagWrite(std::string_view line);
 std::string DiagVoiceName(const Voice* voice);

@@ -121,6 +121,8 @@ struct DiagState {
 };
 
 DiagState g_diag;
+uintptr_t g_diagCaller = 0;
+std::map<uintptr_t, u32> g_diagZeroMatrixCallers;
 
 constexpr u64 DiagMaxCaptureSeconds = 20 * 60;
 constexpr u32 DiagReportSeconds = 5;
@@ -232,6 +234,27 @@ void DiagParam(const Voice* voice, const OrbisNgs2VoiceParamHeader* param, std::
                           param->id, param->size, count, raw));
 }
 
+void DiagSetCaller(uintptr_t caller) {
+    g_diagCaller = caller;
+}
+
+void DiagMatrix(Voice* voice, u32 matrixId) {
+    const auto& matrix = voice->matrices[matrixId];
+    float maxLevel = 0.0f;
+    for (u32 i = 0; i < voice->matrixNumLevels[matrixId]; i++) {
+        maxLevel = std::max(maxLevel, std::abs(matrix[i]));
+    }
+    if (voice->diag.playing) {
+        voice->diag.matrixUpdates++;
+        voice->diag.maxMatrixLevel = std::max(voice->diag.maxMatrixLevel, maxLevel);
+    }
+    if (maxLevel == 0.0f && voice->rack->rackId == ORBIS_NGS2_RACK_ID_SAMPLER &&
+        g_diagZeroMatrixCallers[g_diagCaller]++ < 3) {
+        DiagWrite(fmt::format("zero-matrix {} levels {} caller {:#x}", DiagVoiceName(voice),
+                              voice->matrixNumLevels[matrixId], g_diagCaller));
+    }
+}
+
 void Voice::DiagStart() {
     if (!g_diag.enabled) {
         return;
@@ -254,11 +277,12 @@ void Voice::DiagEnd(std::string_view reason, std::string_view details) {
     if (silent) {
         g_diag.silentEnds++;
     }
-    DiagWrite(fmt::format("end {} #{} reason {} grains {} audible {} peak {:.5f} maxSendGain {:.4f}"
-                          "{} {} route:{}",
-                          DiagVoiceName(this), diag.playId, reason, diag.grains, diag.audibleGrains,
-                          diag.peakOut, diag.maxSendGain, silent ? " SILENT" : "", details,
-                          DiagRoute(this)));
+    DiagWrite(
+        fmt::format("end {} #{} reason {} grains {} audible {} peak {:.5f} maxSendGain {:.4f} "
+                    "matrixUpdates {} maxMatrix {:.4f}{} {} route:{}",
+                    DiagVoiceName(this), diag.playId, reason, diag.grains, diag.audibleGrains,
+                    diag.peakOut, diag.maxSendGain, diag.matrixUpdates, diag.maxMatrixLevel,
+                    silent ? " SILENT" : "", details, DiagRoute(this)));
 }
 
 void DiagRender(System* system, const OrbisNgs2RenderBufferInfo* bufferInfo, u32 numBufferInfo,
@@ -438,12 +462,20 @@ s32 Voice::Control(const OrbisNgs2VoiceParamHeader* param) {
             std::copy_n(p->aLevel, p->numLevels, matrix.begin());
         }
         matrixNumLevels[p->matrixId] = p->numLevels;
+        if (DiagEnabled()) {
+            DiagMatrix(this, p->matrixId);
+        }
         return ORBIS_OK;
     }
     case ORBIS_NGS2_VOICE_PARAM_PORT_VOLUME: {
         const auto* p = reinterpret_cast<const OrbisNgs2VoicePortVolumeParam*>(param);
         if (p->port >= ports.size()) {
             return ORBIS_NGS2_ERROR_INVALID_PORT_INDEX;
+        }
+        if (DiagEnabled() && rack->rackId != ORBIS_NGS2_RACK_ID_SAMPLER &&
+            ports[p->port].volume != p->level) {
+            DiagLog("portvol {} port {} {:.4f} -> {:.4f}", DiagVoiceName(this), p->port,
+                    ports[p->port].volume, p->level);
         }
         ports[p->port].volume = p->level;
         return ORBIS_OK;

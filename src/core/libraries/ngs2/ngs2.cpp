@@ -401,6 +401,9 @@ s32 PS4_SYSV_ABI sceNgs2VoiceControl(OrbisNgs2Handle voiceHandle,
     if (!voice) {
         return HandleReportInvalid(voiceHandle, 4);
     }
+    if (DiagEnabled()) {
+        DiagSetCaller(reinterpret_cast<uintptr_t>(__builtin_return_address(0)));
+    }
     const auto* param = paramList;
     for (u32 count = 0; param; count++) {
         if (count >= MaxVoiceControlParams) {
