@@ -117,6 +117,29 @@ std::string ScanStackForGuestFrames(u64 rsp) {
     return out;
 }
 
+std::string FormatHostBacktrace(const CONTEXT& start) {
+    constexpr u32 MaxHostFrames = 32;
+    CONTEXT ctx = start;
+    std::string out;
+    for (u32 i = 0; i < MaxHostFrames && ctx.Rip; ++i) {
+        out += fmt::format("    #{:<2} {}\n", i, DescribeAddress(ctx.Rip));
+        DWORD64 image_base = 0;
+        auto* entry = RtlLookupFunctionEntry(ctx.Rip, &image_base, nullptr);
+        if (!entry) {
+            if (!ReadU64(ctx.Rsp, ctx.Rip)) {
+                break;
+            }
+            ctx.Rsp += 8;
+            continue;
+        }
+        void* handler_data = nullptr;
+        DWORD64 establisher = 0;
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, ctx.Rip, entry, &ctx, &handler_data,
+                         &establisher, nullptr);
+    }
+    return out;
+}
+
 std::string FormatGuestBacktrace(u64 rip, u64 rsp, u64 rbp) {
     std::string out = fmt::format("    rip {}\n", DescribeAddress(rip));
 
@@ -560,7 +583,7 @@ void ReportUnhandledException(void* exception_pointers, bool guest_thread, s32 g
               "  rsi {:#018x} rdi {:#018x} rbp {:#018x} rsp {:#018x}\n"
               "  r8  {:#018x} r9  {:#018x} r10 {:#018x} r11 {:#018x}\n"
               "  r12 {:#018x} r13 {:#018x} r14 {:#018x} r15 {:#018x}\n"
-              "  backtrace:\n{}",
+              "  guest backtrace:\n{}  host backtrace:\n{}",
               record->ExceptionCode, guest_signal, guest_thread,
               DescribeAddress(reinterpret_cast<u64>(record->ExceptionAddress)),
               is_av ? record->ExceptionInformation[1] : 0,
@@ -568,9 +591,20 @@ void ReportUnhandledException(void* exception_pointers, bool guest_thread, s32 g
               is_av ? record->ExceptionInformation[0] : 0, ctx->Rax, ctx->Rbx, ctx->Rcx, ctx->Rdx,
               ctx->Rsi, ctx->Rdi, ctx->Rbp, ctx->Rsp, ctx->R8, ctx->R9, ctx->R10, ctx->R11,
               ctx->R12, ctx->R13, ctx->R14, ctx->R15,
-              FormatGuestBacktrace(ctx->Rip, ctx->Rsp, ctx->Rbp));
+              FormatGuestBacktrace(ctx->Rip, ctx->Rsp, ctx->Rbp), FormatHostBacktrace(*ctx));
     Common::Log::Flush();
     WriteMinidump("exception", pExp);
+    Common::Log::Flush();
+#endif
+}
+
+void ReportAssertion() {
+#ifdef _WIN32
+    alignas(16) CONTEXT ctx{};
+    RtlCaptureContext(&ctx);
+    LOG_CRITICAL(Debug, "Assertion host backtrace:\n{}", FormatHostBacktrace(ctx));
+    Common::Log::Flush();
+    WriteMinidump("assert", nullptr);
     Common::Log::Flush();
 #endif
 }

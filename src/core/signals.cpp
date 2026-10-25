@@ -223,8 +223,7 @@ static LONG HandleException(EXCEPTION_POINTERS* pExp) noexcept {
         return EXCEPTION_CONTINUE_EXECUTION;
     }
 
-    if (guest_info._si_signo != 0 && code != EXCEPTION_BREAKPOINT &&
-        code != EXCEPTION_SINGLE_STEP) {
+    if (guest_info._si_signo != 0 && code != EXCEPTION_SINGLE_STEP) {
         Diagnostics::ReportUnhandledException(pExp, g_curthread != nullptr, guest_info._si_signo);
     }
 
