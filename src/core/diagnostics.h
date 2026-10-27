@@ -13,6 +13,9 @@ void StartWatchdog();
 
 void NotifyFlip();
 
+// Number of video-out flips since boot.
+u64 FlipCount();
+
 enum class Counter : u32 {
     ReadFaultGpuThread,
     ReadFaultOtherThread,

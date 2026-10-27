@@ -510,6 +510,10 @@ bool SafeRead(u64 address, void* out, u64 size) {
 #endif
 }
 
+u64 FlipCount() {
+    return g_flip_count.load(std::memory_order_relaxed);
+}
+
 void NotifyFlip() {
     const u64 flip = g_flip_count.fetch_add(1, std::memory_order_relaxed) + 1;
     if (g_frame_trace_active.exchange(false)) {

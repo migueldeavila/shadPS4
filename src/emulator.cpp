@@ -32,6 +32,7 @@
 #include "core/debugger.h"
 #include "core/devtools/widget/module_list.h"
 #include "core/diagnostics.h"
+#include "input/scripted_input.h"
 #include "core/emulator_settings.h"
 #include "core/emulator_state.h"
 #include "core/file_format/psf.h"
@@ -712,6 +713,7 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     }
 
     Core::Diagnostics::StartWatchdog();
+    Input::Scripted::StartScriptedInput();
     linker->Execute(args);
 
     window->InitTimers();
