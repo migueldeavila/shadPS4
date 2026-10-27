@@ -233,6 +233,7 @@ private:
 
 bool DiagEnabled();
 void DiagSetCaller(uintptr_t caller);
+void DiagDumpWaveform(const Voice* voice, const void* data, u32 size, std::string_view info);
 void DiagInit();
 void DiagWrite(std::string_view line);
 std::string DiagVoiceName(const Voice* voice);

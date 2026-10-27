@@ -74,6 +74,7 @@ struct DiagWriter {
     std::condition_variable cv;
     std::deque<std::string> lines;
     std::vector<s16> capture;
+    std::deque<std::pair<std::filesystem::path, std::vector<u8>>> dumps;
     std::FILE* file = nullptr;
     std::FILE* captureFile = nullptr;
     std::thread thread;
@@ -81,12 +82,15 @@ struct DiagWriter {
     void Run() {
         std::vector<s16> samples;
         std::deque<std::string> pending;
+        std::deque<std::pair<std::filesystem::path, std::vector<u8>>> pendingDumps;
         while (true) {
             {
                 std::unique_lock lock{mutex};
-                cv.wait(lock, [this] { return !lines.empty() || !capture.empty(); });
+                cv.wait(lock,
+                        [this] { return !lines.empty() || !capture.empty() || !dumps.empty(); });
                 pending.swap(lines);
                 samples.swap(capture);
+                pendingDumps.swap(dumps);
             }
             for (const auto& line : pending) {
                 std::fwrite(line.data(), 1, line.size(), file);
@@ -96,8 +100,15 @@ struct DiagWriter {
                 std::fwrite(samples.data(), sizeof(s16), samples.size(), captureFile);
                 std::fflush(captureFile);
             }
+            for (const auto& [path, bytes] : pendingDumps) {
+                if (std::FILE* dump = std::fopen(path.string().c_str(), "wb")) {
+                    std::fwrite(bytes.data(), 1, bytes.size(), dump);
+                    std::fclose(dump);
+                }
+            }
             pending.clear();
             samples.clear();
+            pendingDumps.clear();
         }
     }
 };
@@ -108,6 +119,9 @@ struct DiagState {
     DiagWriter* writer = nullptr;
     std::array<s16, 2 * 1024> stereo{};
     u64 captureFrames = 0;
+    std::filesystem::path logDir;
+    std::unordered_set<uintptr_t> dumpedWaveforms;
+    size_t dumpedBytes = 0;
     std::chrono::steady_clock::time_point start;
     std::map<std::pair<u32, u32>, u32> paramCounts;
     u32 starts = 0;
@@ -180,6 +194,7 @@ void DiagInit() {
         LOG_ERROR(Lib_Ngs2, "Unable to open NGS2 diagnostics file");
         return;
     }
+    g_diag.logDir = logDir;
     g_diag.writer = new DiagWriter();
     g_diag.writer->file = file;
     g_diag.writer->captureFile = std::fopen((logDir / "ngs2_capture.raw").string().c_str(), "wb");
@@ -232,6 +247,25 @@ void DiagParam(const Voice* voice, const OrbisNgs2VoiceParamHeader* param, std::
     }
     DiagWrite(fmt::format("param {} {} id {:#x} size {} count {}:{}", what, DiagVoiceName(voice),
                           param->id, param->size, count, raw));
+}
+
+void DiagDumpWaveform(const Voice* voice, const void* data, u32 size, std::string_view info) {
+    constexpr size_t MaxDumpedBytes = 64ULL << 20;
+    const auto address = reinterpret_cast<uintptr_t>(data);
+    if (!g_diag.enabled || !data || size == 0 || g_diag.dumpedBytes + size > MaxDumpedBytes ||
+        !g_diag.dumpedWaveforms.insert(address).second) {
+        return;
+    }
+    g_diag.dumpedBytes += size;
+    const std::string name = fmt::format("ngs2_wave_{:x}.bin", address);
+    const auto* bytes = static_cast<const u8*>(data);
+    {
+        std::scoped_lock lock{g_diag.writer->mutex};
+        g_diag.writer->dumps.emplace_back(g_diag.logDir / name,
+                                          std::vector<u8>(bytes, bytes + size));
+    }
+    g_diag.writer->cv.notify_one();
+    DiagWrite(fmt::format("wavedump {} {} size {:#x} {}", DiagVoiceName(voice), name, size, info));
 }
 
 void DiagSetCaller(uintptr_t caller) {

@@ -295,6 +295,13 @@ private:
                       block.numSkipSamples, block.numSamples);
             blocks.push_back({base + block.dataOffset, block.dataSize, block.numRepeats,
                               block.numSkipSamples, block.numSamples, block.userData});
+            if (DiagEnabled() && format.waveformType == ORBIS_NGS2_WAVEFORM_TYPE_VAG) {
+                DiagDumpWaveform(this, base + block.dataOffset, block.dataSize,
+                                 fmt::format("type {:#x} ch {} samples {} skip {} repeats {}",
+                                             format.waveformType, format.numChannels,
+                                             block.numSamples, block.numSkipSamples,
+                                             block.numRepeats));
+            }
         }
         if (DiagEnabled()) {
             const auto* first = param->numBlocks ? &param->aBlock[0] : nullptr;
@@ -461,12 +468,12 @@ private:
                 for (u32 i = 0; i < VagFrameSamples; i++) {
                     const u8 byte = frame[2 + i / 2];
                     const s32 nibble = static_cast<s16>(((i & 1) ? byte >> 4 : byte & 0xF) << 12);
-                    const float sample = static_cast<float>(nibble >> shift) +
-                                         history[0] * coef[0] + history[1] * coef[1];
+                    const float sample = std::clamp(static_cast<float>(nibble >> shift) +
+                                                        history[0] * coef[0] + history[1] * coef[1],
+                                                    -32768.0f, 32767.0f);
                     history[1] = history[0];
                     history[0] = sample;
-                    frameBuffer[i * numChannels + ch] =
-                        std::clamp(sample, -32768.0f, 32767.0f) / 32768.0f;
+                    frameBuffer[i * numChannels + ch] = sample / 32768.0f;
                 }
             }
             outSamples = VagFrameSamples;
